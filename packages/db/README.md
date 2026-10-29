@@ -73,7 +73,10 @@ PostgreSQL advisory lock. Applied files are SHA-256 checked; never edit an
 applied migration—add the next numbered file. `002_import_tracking.sql` adds
 workspace-scoped import staging and external source mappings; `003_workflows.sql`
 adds local workflow storage; `004_address_country.sql` adds raw/display country
-labels to person and company addresses. The runner creates `public.schema_migrations`.
+labels to person and company addresses; `005_taxonomy_settings.sql` adds
+taxonomy display and ordering settings; `006_undoable_workflow_actions.sql` adds
+short-lived, actor-attributed workflow undo snapshots. The runner creates
+`public.schema_migrations`.
 
 ## Mutation and security contracts
 
@@ -104,6 +107,10 @@ labels to person and company addresses. The runner creates `public.schema_migrat
   canonical links.
 - Address `country_code` stores the ISO alpha-2 code; nullable `country_name`
   preserves the raw/display country label needed by legacy imports.
+- Taxonomy terms remain unique by workspace, taxonomy, and normalized label.
+  Their display settings include a validated six-digit hex `color` (default
+  `#6B8E7C`), optional description, active flag, and sort order. Defaults keep
+  existing taxonomy upserts that omit these fields compatible.
 - Import batches are idempotently identified by workspace, import type, and the
   SHA-256 digest of the original source bytes (stored as 32-byte `bytea`, not a
   filename hash). On a uniqueness conflict, reuse the existing batch rather than
@@ -133,6 +140,10 @@ labels to person and company addresses. The runner creates `public.schema_migrat
   Event and meeting-note source links are explicit where applicable. Reminders
   are uniquely scheduled per follow-up/time and retain their delivery or
   dismissal state.
+- Undoable follow-up/meeting-note status actions store before/after JSON object
+  snapshots and expire after five minutes by default. Actions and consumers are
+  attributed to workspace-scoped actors; consumed timestamp and actor must be
+  set together. `target_id` is intentionally polymorphic and has no target FK.
 - Introduction chains point to a target person and owner; step positions are
   unique within each chain and each step references its people/responsible actor.
   The current step is derived as the first nonterminal step, avoiding a stale

@@ -11,7 +11,19 @@ export type PersonRecord = {
   companyName?: string | null
   companies?: Array<string | { id?: string; name?: string }>
   importance?: number | null
-  categories?: string[]
+  categories?: TaxonomyValue[]
+  description?: string | null
+  introducedByPersonId?: string | null
+  introducedByPersonName?: string | null
+  linkedinUrl?: string | null
+  links?: RecordLink[]
+  street?: string | null
+  region?: string | null
+  postalCode?: string | null
+  countryName?: string | null
+  countryCode?: string | null
+  companyIds?: string[]
+  phones?: string[]
   updatedAt?: string
 }
 
@@ -22,8 +34,19 @@ export type CompanyRecord = {
   website?: string | null
   description?: string | null
   city?: string | null
-  industries?: string[]
-  categories?: string[]
+  industries?: TaxonomyValue[]
+  categories?: TaxonomyValue[]
+  domains?: string[]
+  links?: RecordLink[]
+  customerProfile?: string | null
+  businessRole?: string | null
+  ownerUserId?: string | null
+  ownerName?: string | null
+  street?: string | null
+  region?: string | null
+  postalCode?: string | null
+  countryName?: string | null
+  countryCode?: string | null
   peopleCount?: number
   updatedAt?: string
 }
@@ -40,8 +63,13 @@ export type OpportunityRecord = {
   companyName?: string | null
   companies?: Array<string | { id?: string; name?: string }>
   expectedCloseDate?: string | null
+  nextFollowUpAt?: string | null
   nextAction?: string | null
   ownerName?: string | null
+  ownerUserId?: string | null
+  peopleIds?: string[]
+  companyIds?: string[]
+  people?: Array<string | { id?: string; fullName?: string; name?: string }>
   updatedAt?: string
 }
 
@@ -59,7 +87,25 @@ export type NoteRecord = {
   personName?: string | null
   companyName?: string | null
   opportunityName?: string | null
+  personIds?: string[]
+  companyIds?: string[]
+  opportunityIds?: string[]
 }
+
+export type RecordLink = { kind: string; url: string; label?: string }
+
+export type WorkspaceUser = { id: string; fullName: string; email: string; role: string }
+
+export type TaxonomyRecord = {
+  id: string
+  label: string
+  taxonomy: 'PERSON_CATEGORY' | 'COMPANY_CATEGORY' | 'INDUSTRY'
+  color?: string
+  description?: string | null
+  isActive?: boolean
+  sortOrder?: number
+}
+export type TaxonomyValue = string | { label: string; color?: string }
 
 export type RelatedRecordSummary = {
   id?: string

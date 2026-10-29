@@ -1,8 +1,13 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
+const localBrandDirectory = fileURLToPath(new URL('../../brand/', import.meta.url))
 
 export default defineConfig({
   plugins: [react()],
+  publicDir: existsSync(localBrandDirectory) ? localBrandDirectory : false,
   server: {
     host: '0.0.0.0',
     proxy: {

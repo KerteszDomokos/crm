@@ -4,7 +4,9 @@ import type {
   FollowUpRecord,
   MeetingNoteRequirementRecord,
   SearchResult,
+  TaxonomyRecord,
   UserIdentity,
+  WorkspaceUser,
   WarmIntroductionRecord,
 } from './types'
 
@@ -72,6 +74,17 @@ function unwrapObject<T>(payload: unknown): T {
   return payload as T
 }
 
+function announceUndo(payload: unknown): void {
+  if (!payload || typeof payload !== 'object' || typeof window === 'undefined') return
+  const outer = payload as Record<string, unknown>
+  const record = outer.data && typeof outer.data === 'object' ? outer.data as Record<string, unknown> : outer
+  if (typeof record.undoToken === 'string') {
+    window.dispatchEvent(new CustomEvent('resoloon:undo-available', {
+      detail: { token: record.undoToken, label: typeof record.undoLabel === 'string' ? record.undoLabel : 'Action completed' },
+    }))
+  }
+}
+
 export const api = {
   me: async () => {
     const payload = unwrapObject<unknown>(await request<unknown>('/auth/me'))
@@ -113,11 +126,40 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({}),
     }, true)),
-  list: <T,>(resource: string, query?: string) => {
-    const params = new URLSearchParams({ limit: '50' })
-    if (query?.trim()) params.set('q', query.trim())
-    return request<unknown>(`/${resource}?${params.toString()}`).then(unwrapList<T>)
+  list: async <T,>(resource: string, query?: string) => {
+    const pageSize = 100
+    const results: T[] = []
+    let offset = 0
+    while (true) {
+      const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) })
+      if (query?.trim()) params.set('q', query.trim())
+      const page = unwrapList<T>(await request<unknown>(`/${resource}?${params.toString()}`))
+      results.push(...page)
+      if (page.length < pageSize) return results
+      offset += page.length
+    }
   },
+  listLookup: async <T,>(resource: string, query = '') => {
+    const params = new URLSearchParams({ limit: '50' })
+    if (query.trim()) params.set('q', query.trim())
+    return unwrapList<T>(await request<unknown>(`/${resource}?${params.toString()}`))
+  },
+  listWorkspaceUsers: async (query = '') => {
+    const params = new URLSearchParams({ q: query.trim(), limit: '50' })
+    return request<unknown>(`/users?${params.toString()}`).then(unwrapList<WorkspaceUser>)
+  },
+  listTaxonomies: async (taxonomy: TaxonomyRecord['taxonomy'], query = '') => {
+    const params = new URLSearchParams({ taxonomy, q: query.trim(), limit: '50' })
+    return request<unknown>(`/taxonomies?${params.toString()}`).then(unwrapList<TaxonomyRecord>)
+  },
+  listAdminTaxonomies: async (taxonomy: TaxonomyRecord['taxonomy'], query = '') => {
+    const params = new URLSearchParams({ taxonomy, q: query.trim(), limit: '100' })
+    return request<unknown>(`/admin/taxonomies?${params.toString()}`).then(unwrapList<TaxonomyRecord>)
+  },
+  createTaxonomy: (body: { taxonomy: TaxonomyRecord['taxonomy']; label: string; color: string; description?: string }) =>
+    request<TaxonomyRecord>('/admin/taxonomies', { method: 'POST', body: JSON.stringify(body) }, true).then(unwrapObject<TaxonomyRecord>),
+  updateTaxonomy: (id: string, body: Partial<Pick<TaxonomyRecord, 'label' | 'color' | 'description' | 'isActive' | 'sortOrder'>>) =>
+    request<TaxonomyRecord>(`/admin/taxonomies/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }, true).then(unwrapObject<TaxonomyRecord>),
   create: <T,>(resource: string, body: Record<string, unknown>) =>
     request<T>(`/${resource}`, { method: 'POST', body: JSON.stringify(body) }, true).then((payload) => unwrapObject<T>(payload)),
   update: <T,>(resource: string, id: string, body: Record<string, unknown>) =>
@@ -130,7 +172,7 @@ export const api = {
   createFollowUp: (body: Record<string, unknown>) =>
     request<unknown>('/follow-ups', { method: 'POST', body: JSON.stringify(body) }, true).then(unwrapObject<FollowUpRecord>),
   updateFollowUp: (id: string, body: Record<string, unknown>) =>
-    request<unknown>(`/follow-ups/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }, true).then(unwrapObject<FollowUpRecord>),
+    request<unknown>(`/follow-ups/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }, true).then((payload) => { announceUndo(payload); return unwrapObject<FollowUpRecord>(payload) }),
   listIntroductions: () => request<unknown>('/introductions?limit=50').then(unwrapList<WarmIntroductionRecord>),
   createIntroduction: (body: Record<string, unknown>) =>
     request<unknown>('/introductions', { method: 'POST', body: JSON.stringify(body) }, true).then(unwrapObject<WarmIntroductionRecord>),
@@ -140,9 +182,10 @@ export const api = {
   createMeetingNote: (body: { eventId: string; title?: string }) =>
     request<unknown>('/meeting-notes', { method: 'POST', body: JSON.stringify(body) }, true).then(unwrapObject<MeetingNoteRequirementRecord>),
   completeMeetingNote: (id: string, body: { summary: string; nextStepsMarkdown?: string; followUpDate?: string }) =>
-    request<unknown>(`/meeting-notes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ ...body, status: 'COMPLETED' }) }, true).then(unwrapObject<MeetingNoteRequirementRecord>),
+    request<unknown>(`/meeting-notes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ ...body, status: 'COMPLETED' }) }, true).then((payload) => { announceUndo(payload); return unwrapObject<MeetingNoteRequirementRecord>(payload) }),
   cancelMeetingNote: (id: string, reason: string) =>
-    request<unknown>(`/meeting-notes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ status: 'CANCELLED', cancellationReason: reason }) }, true).then(unwrapObject<MeetingNoteRequirementRecord>),
+    request<unknown>(`/meeting-notes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ status: 'CANCELLED', cancellationReason: reason }) }, true).then((payload) => { announceUndo(payload); return unwrapObject<MeetingNoteRequirementRecord>(payload) }),
+  undo: (token: string) => request<{ undone: boolean; actionType: string; targetId: string }>(`/undo/${encodeURIComponent(token)}`, { method: 'POST', body: JSON.stringify({}) }, true),
   dashboard: async () => unwrapObject<DashboardData>(await request<unknown>('/dashboard')),
   search: async (query: string) => {
     const params = new URLSearchParams({ q: query, limit: '8' })
@@ -167,6 +210,7 @@ export const api = {
     return []
   },
 }
+
 
 export type AdminUser = {
   id: string

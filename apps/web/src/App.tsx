@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import {
   ArrowLeft,
   ArrowUpRight,
@@ -25,6 +25,8 @@ import {
   BriefcaseBusiness,
 } from 'lucide-react'
 import { Link, NavLink, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { api, ApiError, recordPath, type AdminUser } from './api'
 import type {
   CompanyRecord,
@@ -38,6 +40,9 @@ import type {
   PersonRecord,
   SearchResult,
   UserIdentity,
+  TaxonomyRecord,
+  WorkspaceUser,
+  RecordLink,
   WarmIntroductionRecord,
 } from './types'
 
@@ -55,7 +60,23 @@ type ResourceDefinition<T> = {
   summary?: (records: T[]) => string
 }
 
-type FormField = { name: string; label: string; type?: string; required?: boolean; placeholder?: string; options?: string[] }
+type LookupSource = 'people' | 'companies' | 'opportunities' | 'records' | 'users' | 'PERSON_CATEGORY' | 'COMPANY_CATEGORY' | 'INDUSTRY'
+type LookupOption = { id: string; label: string; subtitle?: string; color?: string; recordType?: string }
+type FormField = {
+  name: string
+  label: string
+  type?: string
+  required?: boolean
+  placeholder?: string
+  options?: string[]
+  source?: LookupSource
+  multiple?: boolean
+  allowCustom?: boolean
+  wide?: boolean
+  help?: string
+  min?: number
+  max?: number
+}
 type ResourceFormDefinition = { resource: string; singular: string; fields: FormField[] }
 
 function formatDate(value?: string | null) {
@@ -112,6 +133,12 @@ function useResource<T>(resource: string) {
     return () => { active = false }
   }, [resource, refreshToken])
 
+  useEffect(() => {
+    const refresh = () => reload()
+    window.addEventListener('resoloon:workflow-refresh', refresh)
+    return () => window.removeEventListener('resoloon:workflow-refresh', refresh)
+  }, [reload])
+
   return { records, loading, error, reload }
 }
 
@@ -166,74 +193,351 @@ function ResourcePage<T extends { id: string }>({ definition }: { definition: Re
   </section>
 }
 
-function RecordFormDialog({ definition, record, onClose, onSaved, save }: { definition: ResourceFormDefinition; record?: Record<string, unknown>; onClose: () => void; onSaved: () => void; save?: (values: Record<string, unknown>) => Promise<unknown> }) {
-  const [pending, setPending] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    setError(null)
-    setPending(true)
-    const form = new FormData(event.currentTarget)
-    const values: Record<string, unknown> = {}
-    if (record && typeof record.version === 'number') values.version = record.version
-    definition.fields.forEach((field) => {
-      const value = form.get(field.name)?.toString().trim()
-      if (value) {
-        if (field.type === 'number') values[field.name] = Number(value)
-        else if (field.type === 'datetime-local') values[field.name] = workspaceDateTimeToIso(value)
-        else values[field.name] = value
-      }
-    })
-    try {
-      if (save) await save(values)
-      else if (record?.id) await api.update(definition.resource, String(record.id), values)
-      else await api.create(definition.resource, values)
-      onSaved()
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Unable to create this record.')
-    } finally {
-      setPending(false)
-    }
-  }
-
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="create-title">
-    <div className="modal-header"><div><div className="eyebrow">{record ? 'Edit record' : 'New record'}</div><h2 id="create-title">{record ? `Edit ${definition.singular.toLowerCase()}` : `Add ${definition.singular.toLowerCase()}`}</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={16} /></button></div>
-    <form onSubmit={submit} className="form-body">
-      {definition.fields.map((field) => {
-        const initial = fieldInitialValue(field.name, record)
-        return <label className="form-field" key={field.name}><span>{field.label}{field.required && <b className="required-mark"> *</b>}</span>{field.options ? <select name={field.name} required={field.required} defaultValue={initial || field.options[0]}><option value="" disabled>Select {field.label.toLowerCase()}</option>{field.options.map((option) => <option key={option} value={option}>{option.charAt(0) + option.slice(1).toLowerCase()}</option>)}</select> : field.type === 'textarea' ? <textarea name={field.name} placeholder={field.placeholder} rows={4} required={field.required} defaultValue={initial} /> : <input type={field.type ?? 'text'} name={field.name} placeholder={field.placeholder} required={field.required} step={field.type === 'number' ? 'any' : undefined} defaultValue={initial} />}</label>
-      })}
-      {error && <div className="form-error" role="alert">{error}</div>}
-      <div className="modal-actions"><button type="button" className="button button-ghost" onClick={onClose} disabled={pending}>Cancel</button><button type="submit" className="button button-primary" disabled={pending}>{pending ? <LoaderCircle size={15} className="spin" /> : record ? <Check size={15} /> : <Plus size={15} />}{record ? 'Save changes' : `Create ${definition.singular.toLowerCase()}`}</button></div>
-    </form>
-  </section></div>
+function displayStage(value: string) {
+  return value.toLowerCase().replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
 
-function fieldInitialValue(name: string, record?: Record<string, unknown>) {
-  if (!record) return ''
-  const value = record[name]
-  if (value != null) {
-    if (name === 'expectedCloseDate' || name === 'followUpDate' || name === 'dueAt') return String(value).slice(0, 10)
-    if (name === 'startAt' || name === 'endAt') {
-      const date = new Date(String(value))
-      return Number.isNaN(date.getTime()) ? String(value) : new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16)
-    }
-    return String(value)
+function toLookupOptions(source: LookupSource | undefined, payload: unknown): LookupOption[] {
+  if (!Array.isArray(payload)) return []
+  if (source === 'PERSON_CATEGORY' || source === 'COMPANY_CATEGORY' || source === 'INDUSTRY') {
+    return (payload as TaxonomyRecord[]).map((item) => ({ id: item.label, label: item.label }))
   }
-  if (name === 'email') {
-    const emails = record.emails
-    if (Array.isArray(emails) && emails.length) {
-      const first = emails[0]
-      return typeof first === 'string' ? first : String(first.primaryEmail ?? first.email ?? first.address ?? '')
+  if (source === 'users') return (payload as WorkspaceUser[]).map((item) => ({ id: item.id, label: item.fullName, subtitle: item.email }))
+  if (source === 'records') return (payload as SearchResult[]).map((item) => ({ id: item.id, label: item.title ?? item.name ?? 'Record', subtitle: item.recordType ?? item.type, recordType: item.recordType ?? item.type }))
+  if (source === 'people') return (payload as PersonRecord[]).map((item) => ({ id: item.id, label: personName(item), subtitle: item.jobTitle ?? emailOf(item) }))
+  if (source === 'companies') return (payload as CompanyRecord[]).map((item) => ({ id: item.id, label: companyName(item), subtitle: item.domain ?? item.website ?? item.domains?.[0] }))
+  if (source === 'opportunities') return (payload as OpportunityRecord[]).map((item) => ({ id: item.id, label: item.name, subtitle: item.stage ? displayStage(item.stage) : undefined }))
+  return []
+}
+
+async function loadLookupOptions(source: LookupSource, query: string): Promise<LookupOption[]> {
+  if (source === 'users') return toLookupOptions(source, await api.listWorkspaceUsers(query))
+  if (source === 'PERSON_CATEGORY' || source === 'COMPANY_CATEGORY' || source === 'INDUSTRY') return toLookupOptions(source, await api.listTaxonomies(source, query))
+  if (source === 'records') return query.trim().length >= 2 ? toLookupOptions(source, await api.search(query)) : []
+  return toLookupOptions(source, await api.listLookup(source, query))
+}
+
+function SearchablePicker({
+  selected, onChange, source, options = [], multiple = false, allowCustom = false, placeholder, label, disabled = false,
+}: {
+  selected: LookupOption[]
+  onChange: (items: LookupOption[]) => void
+  source?: LookupSource
+  options?: LookupOption[]
+  multiple?: boolean
+  allowCustom?: boolean
+  placeholder?: string
+  label: string
+  disabled?: boolean
+}) {
+  const listId = useId()
+  const rootRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const [query, setQuery] = useState('')
+  const [remoteOptions, setRemoteOptions] = useState<LookupOption[]>([])
+  const [loading, setLoading] = useState(false)
+  const [open, setOpen] = useState(false)
+  const [highlighted, setHighlighted] = useState(0)
+
+  useEffect(() => {
+    if (!source) { setRemoteOptions([]); return }
+    let active = true
+    setLoading(true)
+    const timer = window.setTimeout(() => {
+      loadLookupOptions(source, query).then((items) => { if (active) setRemoteOptions(items) }).catch(() => { if (active) setRemoteOptions([]) }).finally(() => { if (active) setLoading(false) })
+    }, query ? 180 : 0)
+    return () => { active = false; window.clearTimeout(timer) }
+  }, [source, query])
+
+  useEffect(() => {
+    function closeOutside(event: MouseEvent) {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
     }
-    return String(record.primaryEmail ?? '')
+    document.addEventListener('mousedown', closeOutside)
+    return () => document.removeEventListener('mousedown', closeOutside)
+  }, [])
+
+  const baseOptions = source ? remoteOptions : options
+  const displayedSelected = selected.map((item) => {
+    const match = baseOptions.find((option) => option.id === item.id)
+    return match ? { ...item, label: match.label, subtitle: match.subtitle, color: match.color } : item
+  })
+  const filtered = baseOptions.filter((item) => {
+    const match = `${item.label} ${item.subtitle ?? ''}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
+    return match && !selected.some((chosen) => chosen.id === item.id)
+  })
+  const canAddCustom = allowCustom && query.trim().length > 0 && ![...baseOptions, ...selected].some((item) => item.label.toLocaleLowerCase() === query.trim().toLocaleLowerCase())
+  const rows = [...filtered, ...(canAddCustom ? [{ id: `__custom__${query.trim()}`, label: `Add “${query.trim()}”`, subtitle: 'Use this value', customValue: query.trim() } as LookupOption & { customValue: string }] : [])]
+
+  function choose(item: LookupOption & { customValue?: string }) {
+    const value = item.customValue ? { id: item.customValue, label: item.customValue } : { id: item.id, label: item.label, subtitle: item.subtitle, color: item.color, recordType: item.recordType }
+    onChange(multiple ? [...selected, value] : [value])
+    setQuery('')
+    setHighlighted(0)
+    setOpen(false)
+    if (multiple) inputRef.current?.focus()
   }
-  if (name === 'phone') return String(record.primaryPhone ?? '')
-  if (name === 'domain') return String(record.primaryDomain ?? record.website ?? '')
-  if (name === 'bodyMarkdown') return String(record.body ?? '')
-  if (name === 'noteType') return String(record.type ?? 'GENERAL')
-  return ''
+
+  function onKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'ArrowDown') { event.preventDefault(); setOpen(true); setHighlighted((index) => rows.length ? (index + 1) % rows.length : 0) }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); setOpen(true); setHighlighted((index) => rows.length ? (index - 1 + rows.length) % rows.length : 0) }
+    else if (event.key === 'Enter') {
+      event.preventDefault()
+      if (!open) setOpen(true)
+      else if (rows[highlighted]) choose(rows[highlighted])
+    } else if (event.key === 'Escape') { setOpen(false); setQuery('') }
+    else if (event.key === 'Backspace' && !query && selected.length) onChange(selected.slice(0, -1))
+  }
+
+  return <div className={`search-picker${disabled ? ' is-disabled' : ''}`} ref={rootRef}>
+    <div className="picker-control" onClick={() => { if (!disabled) { setOpen(true); inputRef.current?.focus() } }}>
+      {displayedSelected.map((item, index) => <span className={`picker-chip${item.color ? ' taxonomy-picker-chip' : ''}`} key={`${item.id}-${index}`} style={item.color ? { color: item.color, borderColor: `${item.color}66`, backgroundColor: `${item.color}22` } : undefined}><span>{item.label}</span><button type="button" aria-label={`Remove ${item.label}`} onClick={(event) => { event.stopPropagation(); onChange(selected.filter((_, itemIndex) => itemIndex !== index)) }} disabled={disabled}><X size={12} /></button></span>)}
+      <input ref={inputRef} role="combobox" aria-label={label} aria-expanded={open} aria-controls={listId} aria-autocomplete="list" aria-activedescendant={open && rows[highlighted] ? `${listId}-${highlighted}` : undefined} value={query} disabled={disabled} placeholder={selected.length && multiple ? '' : placeholder ?? `Search ${label.toLowerCase()}…`} onFocus={() => setOpen(true)} onChange={(event) => { setQuery(event.target.value); setHighlighted(0); setOpen(true) }} onKeyDown={onKeyDown} />
+      {selected.length > 0 && !multiple && <button className="picker-clear" type="button" aria-label={`Clear ${label}`} onClick={(event) => { event.stopPropagation(); onChange([]); setQuery(''); inputRef.current?.focus() }} disabled={disabled}><X size={13} /></button>}
+      <ChevronDown size={14} className="picker-chevron" />
+    </div>
+    {open && !disabled && <div className="picker-popover"><ul id={listId} role="listbox" aria-label={`${label} options`} aria-multiselectable={multiple || undefined}>
+      {loading && <li className="picker-empty" role="presentation"><LoaderCircle size={13} className="spin" />Searching…</li>}
+      {!loading && rows.map((item, index) => <li key={`${item.id}-${index}`} id={`${listId}-${index}`} role="option" aria-selected={selected.some((choice) => choice.id === item.id)} className={index === highlighted ? 'picker-option is-highlighted' : 'picker-option'} onMouseEnter={() => setHighlighted(index)} onMouseDown={(event) => event.preventDefault()} onClick={() => choose(item)}><span><strong>{item.label}</strong>{item.subtitle && <small>{item.subtitle}</small>}</span>{index === highlighted && <Check size={13} />}</li>)}
+      {!loading && rows.length === 0 && <li className="picker-empty" role="presentation">{query ? 'No matches. Keep typing to add a value.' : `No ${label.toLowerCase()} available.`}</li>}
+    </ul></div>}
+  </div>
+}
+
+function listAsStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.map((item) => typeof item === 'string' ? item : item && typeof item === 'object' ? String((item as Record<string, unknown>).label ?? (item as Record<string, unknown>).name ?? (item as Record<string, unknown>).fullName ?? (item as Record<string, unknown>).email ?? (item as Record<string, unknown>).primaryEmail ?? (item as Record<string, unknown>).address ?? (item as Record<string, unknown>).phone ?? (item as Record<string, unknown>).domain ?? '') : '').filter(Boolean)
+}
+
+function relatedChoices(field: FormField, record?: Record<string, unknown>): LookupOption[] {
+  if (!record) return []
+  const name = field.name
+  if (field.source === 'people' && name === 'companyIds') {
+    const values = Array.isArray(record.companies) ? record.companies : []
+    return values.flatMap((item) => typeof item === 'object' && item ? [{ id: String((item as Record<string, unknown>).id ?? ''), label: String((item as Record<string, unknown>).name ?? 'Company') }] : [])
+  }
+  if (field.source === 'companies' && name === 'companyIds') {
+    const values = Array.isArray(record.companies) ? record.companies : []
+    return values.flatMap((item) => typeof item === 'object' && item ? [{ id: String((item as Record<string, unknown>).id ?? ''), label: String((item as Record<string, unknown>).name ?? 'Company') }] : [])
+  }
+  if (field.source === 'people' && name === 'personIds') {
+    const values = Array.isArray(record.people) ? record.people : []
+    return values.flatMap((item) => typeof item === 'object' && item ? [{ id: String((item as Record<string, unknown>).id ?? ''), label: String((item as Record<string, unknown>).fullName ?? (item as Record<string, unknown>).name ?? 'Person') }] : [])
+  }
+  if (field.source === 'people' && name === 'introducedByPersonId' && record.introducedByPersonId) return [{ id: String(record.introducedByPersonId), label: String(record.introducedByPersonName ?? 'Introducer') }]
+  if (field.source === 'users') {
+    const id = name === 'assigneeUserId' ? record.assigneeUserId : name === 'responsibleUserId' ? record.responsibleUserId : record.ownerUserId
+    const label = name === 'assigneeUserId' ? record.assigneeName : name === 'responsibleUserId' ? record.responsibleName : record.ownerName
+    if (id) return [{ id: String(id), label: String(label ?? 'Workspace member') }]
+  }
+  if (field.source === 'records' && Array.isArray(record.relatedRecords)) return (record.relatedRecords as Array<Record<string, unknown>>).map((item) => ({ id: String(item.id), label: String(item.name ?? 'Related record'), subtitle: String(item.type ?? '') }))
+  if (field.name === 'companyIds' || field.name === 'personIds' || field.name === 'opportunityIds') {
+    const related = Array.isArray(record.relatedRecords) ? record.relatedRecords as Array<Record<string, unknown>> : []
+    const expected = name.startsWith('person') ? 'person' : name.startsWith('compan') ? 'compan' : 'opportun'
+    return related.filter((item) => item.id && String(item.type ?? '').toLowerCase().includes(expected)).map((item) => ({ id: String(item.id), label: String(item.name ?? 'Related record') }))
+  }
+  return []
+}
+
+function fieldInitialValue(field: FormField, record?: Record<string, unknown>): unknown {
+  if (!record) {
+    if (field.options?.length) return [{ id: field.options[0], label: displayStage(field.options[0]) }]
+    return field.type === 'picker' || field.type === 'links' ? [] : ''
+  }
+  const name = field.name
+  if (field.type === 'links') return Array.isArray(record.links) ? record.links as RecordLink[] : []
+  if (field.options) {
+    const raw = record[name] ?? (name === 'noteType' ? record.type : undefined) ?? field.options[0]
+    const option = String(raw)
+    return [{ id: option, label: displayStage(option) }]
+  }
+  if (field.type === 'picker') {
+    if (field.source === 'PERSON_CATEGORY' || field.source === 'COMPANY_CATEGORY' || field.source === 'INDUSTRY' || !field.source) {
+      let values: string[] = []
+      if (name === 'emails') values = listAsStrings(record.emails).length ? listAsStrings(record.emails) : [record.primaryEmail ?? record.email].filter((item): item is string => typeof item === 'string' && Boolean(item))
+      else if (name === 'phones') values = listAsStrings(record.phones).length ? listAsStrings(record.phones) : [record.phone ?? record.primaryPhone].filter((item): item is string => typeof item === 'string' && Boolean(item))
+      else if (name === 'domains') values = listAsStrings(record.domains).length ? listAsStrings(record.domains) : [record.domain ?? record.primaryDomain].filter((item): item is string => typeof item === 'string' && Boolean(item))
+      else values = listAsStrings(record[name])
+      return values.map((value) => ({ id: value, label: value }))
+    }
+    const related = relatedChoices(field, record)
+    const value = record[name]
+      const values = field.multiple ? (Array.isArray(value) ? value : name === 'companyIds' && Array.isArray(record.companies) ? (record.companies as Array<Record<string, unknown>>).map((item) => item.id) : name === 'personIds' && Array.isArray(record.people) ? (record.people as Array<Record<string, unknown>>).map((item) => item.id) : related.map((item) => item.id)) : value == null ? [] : [value]
+    return values.filter((item) => item != null).map((item) => {
+      const id = String(item)
+      const known = related.find((option) => option.id === id)
+      if (known) return known
+      if (field.options?.includes(id)) return { id, label: displayStage(id) }
+      return { id, label: field.source === 'people' ? 'Selected person' : field.source === 'companies' ? 'Selected company' : field.source === 'users' ? 'Workspace member' : 'Related record' }
+    })
+  }
+  let value = record[name]
+  if (value == null) {
+    if (name === 'bodyMarkdown') value = record.body
+    else if (name === 'noteType') value = record.type ?? 'GENERAL'
+    else if (name === 'fullName' && record.name && typeof record.name === 'object') {
+      const nestedName = record.name as { firstName?: string; lastName?: string }
+      value = [nestedName.firstName, nestedName.lastName].filter(Boolean).join(' ')
+    }
+    else if (name === 'street' || name === 'region' || name === 'postalCode' || name === 'countryName' || name === 'countryCode') value = ''
+    else if (name === 'startAt' || name === 'endAt') value = record[name === 'startAt' ? 'startsAt' : 'endsAt']
+  }
+  if (value != null && (field.type === 'date' || name === 'expectedCloseDate' || name === 'followUpDate' || name === 'dueAt')) return String(value).slice(0, 10)
+  if (value != null && field.type === 'datetime-local') {
+    const date = new Date(String(value))
+    return Number.isNaN(date.getTime()) ? String(value) : new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16)
+  }
+  return value == null ? '' : String(value)
+}
+
+function LinkEditor({ links, onChange }: { links: RecordLink[]; onChange: (links: RecordLink[]) => void }) {
+  return <div className="link-editor">
+    {links.map((link, index) => <div className="link-editor-row" key={index}>
+      <input aria-label={`Link ${index + 1} type`} value={link.kind} placeholder="Type (website, X…)" onChange={(event) => onChange(links.map((item, itemIndex) => itemIndex === index ? { ...item, kind: event.target.value } : item))} />
+      <input aria-label={`Link ${index + 1} URL`} type="url" value={link.url} placeholder="https://…" onChange={(event) => onChange(links.map((item, itemIndex) => itemIndex === index ? { ...item, url: event.target.value } : item))} />
+      <input aria-label={`Link ${index + 1} label`} value={link.label ?? ''} placeholder="Label (optional)" onChange={(event) => onChange(links.map((item, itemIndex) => itemIndex === index ? { ...item, label: event.target.value } : item))} />
+      <button type="button" className="icon-button link-remove" aria-label={`Remove link ${index + 1}`} onClick={() => onChange(links.filter((_, itemIndex) => itemIndex !== index))}><X size={14} /></button>
+    </div>)}
+    <button type="button" className="button button-ghost button-small" onClick={() => onChange([...links, { kind: '', url: '', label: '' }])}><Plus size={13} />Add link</button>
+  </div>
+}
+
+function MarkdownField({ value, onChange, label, placeholder }: { value: string; onChange: (value: string) => void; label: string; placeholder?: string }) {
+  const [editing, setEditing] = useState(false)
+  return <div className="markdown-field">
+    <div className="markdown-field-toolbar"><span>{editing ? 'Markdown source' : 'Rendered preview'}</span><button type="button" className="button button-ghost button-small" onClick={() => setEditing((current) => !current)}>{editing ? 'Preview' : 'Edit Markdown'}</button></div>
+    {editing
+      ? <textarea aria-label={`${label} Markdown source`} className="markdown-source" value={value} onChange={(event) => onChange(event.target.value)} rows={10} placeholder={placeholder ?? 'Write with Markdown…'} />
+      : value.trim()
+        ? <div className="markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{value}</ReactMarkdown></div>
+        : <div className="markdown-preview markdown-empty">No note content yet. Choose <strong>Edit Markdown</strong> to write the first draft.</div>}
+  </div>
+}
+
+function workspaceDateAfter(days: number): string {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Budapest', year: 'numeric', month: '2-digit', day: '2-digit',
+  })
+  const today = Object.fromEntries(formatter.formatToParts(new Date()).map((part) => [part.type, part.value]))
+  const target = new Date(Date.UTC(Number(today.year), Number(today.month) - 1, Number(today.day) + days, 12))
+  const parts = Object.fromEntries(formatter.formatToParts(target).map((part) => [part.type, part.value]))
+  return `${parts.year}-${parts.month}-${parts.day}`
+}
+
+function DateQuickInput({
+  type = 'date', name, value, defaultValue = '', onChange, label, required = false,
+}: {
+  type?: 'date' | 'datetime-local'
+  name?: string
+  value?: string
+  defaultValue?: string
+  onChange?: (value: string) => void
+  label: string
+  required?: boolean
+}) {
+  const [internalValue, setInternalValue] = useState(defaultValue)
+  const current = value ?? internalValue
+  const update = (next: string) => {
+    if (onChange) onChange(next)
+    else setInternalValue(next)
+  }
+  const presets = [
+    { label: 'Today', days: 0 },
+    { label: 'Tomorrow', days: 1 },
+    { label: 'In 2 days', days: 2 },
+    { label: 'In 4 days', days: 4 },
+    { label: 'Next week', days: 7 },
+  ]
+  return <div className="date-quick-input">
+    <div className="date-shortcuts" aria-label={`Quick ${label.toLowerCase()} options`}>
+      {presets.map((preset) => {
+        const date = workspaceDateAfter(preset.days)
+        const next = type === 'datetime-local' ? `${date}T09:00` : date
+        return <button type="button" key={preset.label} className={current === next ? 'date-shortcut selected' : 'date-shortcut'} onClick={() => update(next)}>{preset.label}</button>
+      })}
+    </div>
+    <input aria-label={label} name={name} type={type} value={current} required={required} onChange={(event) => update(event.target.value)} />
+  </div>
+}
+
+function RecordEditorForm({ definition, record, inline = false, onSave, onCancel, onSaved, onReload }: {
+  definition: ResourceFormDefinition
+  record?: Record<string, unknown>
+  inline?: boolean
+  onSave: (values: Record<string, unknown>) => Promise<unknown>
+  onCancel?: () => void
+  onSaved: () => void
+  onReload?: () => void
+}) {
+  const [values, setValues] = useState<Record<string, unknown>>(() => Object.fromEntries(definition.fields.map((field) => [field.name, fieldInitialValue(field, record)])))
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [status, setStatus] = useState('')
+  const [conflict, setConflict] = useState(false)
+
+  function setValue(name: string, value: unknown) { setValues((current) => ({ ...current, [name]: value })); setStatus(''); setError(null) }
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setPending(true); setError(null); setStatus(''); setConflict(false)
+    const payload: Record<string, unknown> = {}
+    if (record && record.version != null) payload.version = record.version
+    try {
+      definition.fields.forEach((field) => {
+        const value = values[field.name]
+        if (field.type === 'picker') {
+          const selected = (Array.isArray(value) ? value : []) as LookupOption[]
+          payload[field.name] = field.multiple ? selected.map((item) => item.id) : selected[0]?.id ?? (record ? null : undefined)
+        } else if (field.type === 'links') {
+          payload.links = (Array.isArray(value) ? value as RecordLink[] : []).filter((link) => link.kind.trim() && link.url.trim()).map((link) => ({ kind: link.kind.trim(), url: link.url.trim(), ...(link.label?.trim() ? { label: link.label.trim() } : {}) }))
+        } else if (field.options) {
+          const selected = (Array.isArray(value) ? value : []) as LookupOption[]
+          payload[field.name] = selected[0]?.id ?? null
+        } else if (typeof value === 'string') {
+          if (!value.trim()) payload[field.name] = record ? null : undefined
+          else if (field.type === 'number') payload[field.name] = Number(value)
+          else if (field.type === 'datetime-local') payload[field.name] = workspaceDateTimeToIso(value)
+          else payload[field.name] = value.trim()
+        }
+      })
+      Object.keys(payload).forEach((key) => { if (payload[key] === undefined) delete payload[key] })
+      await onSave(payload)
+      setStatus(record ? 'Changes saved.' : `${definition.singular} created.`)
+      onSaved()
+    } catch (reason) {
+      const apiError = reason instanceof ApiError ? reason : null
+      setConflict(apiError?.status === 409 || apiError?.status === 412)
+      setError(apiError?.status === 409 || apiError?.status === 412 ? 'This record changed elsewhere. Reload the latest version, then reapply your changes.' : reason instanceof Error ? reason.message : 'Unable to save this record.')
+    } finally { setPending(false) }
+  }
+
+  return <form onSubmit={submit} className={`form-body record-editor-form${inline ? ' record-editor-inline' : ''}`}>
+    <div className="record-editor-grid">
+      {definition.fields.map((field) => {
+        const value = values[field.name]
+        const className = `form-field${field.wide ? ' field-wide' : ''}`
+        const caption = <span>{field.label}{field.required && <b className="required-mark"> *</b>}</span>
+        if (field.type === 'picker' || field.options) {
+          const selected = Array.isArray(value) ? value as LookupOption[] : []
+          const choices = field.options?.map((option) => ({ id: option, label: displayStage(option) }))
+          return <label className={className} key={field.name}>{caption}{field.help && <small className="field-help">{field.help}</small>}<SearchablePicker label={field.label} selected={selected} onChange={(items) => setValue(field.name, items)} source={field.source} options={choices} multiple={field.multiple} allowCustom={field.allowCustom} placeholder={field.placeholder} /></label>
+        }
+        if (field.type === 'links') return <div className={className} key={field.name}><span>{field.label}</span><LinkEditor links={Array.isArray(value) ? value as RecordLink[] : []} onChange={(items) => setValue(field.name, items)} /></div>
+        if (field.type === 'date' || field.type === 'datetime-local') return <div className={className} key={field.name}><span>{field.label}{field.required && <b className="required-mark"> *</b>}</span>{field.help && <small className="field-help">{field.help}</small>}<DateQuickInput type={field.type} label={field.label} value={String(value ?? '')} onChange={(next) => setValue(field.name, next)} required={field.required} /></div>
+        if (field.type === 'markdown') return <div className={className} key={field.name}><span>{field.label}</span><MarkdownField label={field.label} value={String(value ?? '')} onChange={(next) => setValue(field.name, next)} placeholder={field.placeholder} /></div>
+        if (field.type === 'textarea') return <label className={className} key={field.name}>{caption}{field.help && <small className="field-help">{field.help}</small>}<textarea value={String(value ?? '')} placeholder={field.placeholder} rows={field.name === 'bodyMarkdown' ? 8 : 4} required={field.required} onChange={(event) => setValue(field.name, event.target.value)} /></label>
+        return <label className={className} key={field.name}>{caption}{field.help && <small className="field-help">{field.help}</small>}<input type={field.type ?? 'text'} value={String(value ?? '')} placeholder={field.placeholder} required={field.required} min={field.min} max={field.max} step={field.type === 'number' ? field.min != null || field.max != null ? '1' : 'any' : undefined} onChange={(event) => setValue(field.name, event.target.value)} /></label>
+      })}
+    </div>
+    {error && <div className="form-error" role="alert">{error}{conflict && onReload && <button type="button" className="button button-ghost button-small conflict-reload" onClick={onReload}>Reload record</button>}</div>}
+    <div className="editor-footer"><span className="editor-status" role="status" aria-live="polite">{pending ? 'Saving changes…' : status}</span><div className="modal-actions">{onCancel && <button type="button" className="button button-ghost" onClick={onCancel} disabled={pending}>Cancel</button>}<button type="submit" className="button button-primary" disabled={pending}>{pending ? <LoaderCircle size={15} className="spin" /> : record ? <Check size={15} /> : <Plus size={15} />}{record ? 'Save changes' : `Create ${definition.singular.toLowerCase()}`}</button></div></div>
+  </form>
+}
+
+function RecordFormDialog({ definition, onClose, onSaved, save }: { definition: ResourceFormDefinition; onClose: () => void; onSaved: () => void; save?: (values: Record<string, unknown>) => Promise<unknown> }) {
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal record-modal" role="dialog" aria-modal="true" aria-labelledby="create-title">
+    <div className="modal-header"><div><div className="eyebrow">New record</div><h2 id="create-title">Add {definition.singular.toLowerCase()}</h2><p className="dialog-hint">Capture the details and connect it to the right people and organizations.</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={16} /></button></div>
+    <RecordEditorForm definition={definition} onSave={save ?? ((values) => api.create(definition.resource, values))} onCancel={onClose} onSaved={onSaved} />
+  </section></div>
 }
 
 const peopleDefinition: ResourceDefinition<PersonRecord> = {
@@ -243,9 +547,21 @@ const peopleDefinition: ResourceDefinition<PersonRecord> = {
   fields: [
     { name: 'fullName', label: 'Full name', required: true, placeholder: 'Name as it appears in your workspace' },
     { name: 'jobTitle', label: 'Job title', placeholder: 'e.g. Partnerships lead' },
-    { name: 'email', label: 'Email address', type: 'email', placeholder: 'name@company.com' },
-    { name: 'phone', label: 'Phone', type: 'tel', placeholder: '+36 00 000 0000' },
+    { name: 'importance', label: 'Importance (1–5)', type: 'number', min: 1, max: 5, placeholder: '3' },
+    { name: 'emails', label: 'Email addresses', type: 'picker', multiple: true, allowCustom: true, placeholder: 'Add an email and press Enter' },
+    { name: 'phones', label: 'Phone numbers', type: 'picker', multiple: true, allowCustom: true, placeholder: 'Add a phone number and press Enter' },
+    { name: 'companyIds', label: 'Companies', type: 'picker', source: 'companies', multiple: true, placeholder: 'Search companies by name' },
+    { name: 'introducedByPersonId', label: 'Introduced by', type: 'picker', source: 'people', placeholder: 'Search people by name' },
+    { name: 'linkedinUrl', label: 'LinkedIn profile', type: 'url', placeholder: 'https://linkedin.com/in/…' },
+    { name: 'links', label: 'Other links', type: 'links', wide: true },
+    { name: 'street', label: 'Street address', placeholder: 'Street and number' },
     { name: 'city', label: 'City', placeholder: 'Budapest' },
+    { name: 'region', label: 'Region / state', placeholder: 'Pest' },
+    { name: 'postalCode', label: 'Postal code', placeholder: '1051' },
+    { name: 'countryName', label: 'Country', placeholder: 'Hungary' },
+    { name: 'countryCode', label: 'Country code', placeholder: 'HU' },
+    { name: 'categories', label: 'Categories', type: 'picker', source: 'PERSON_CATEGORY', multiple: true, allowCustom: true, placeholder: 'Search or add a category' },
+    { name: 'description', label: 'Description', type: 'textarea', wide: true, placeholder: 'Background, interests, and relationship context' },
   ],
   columns: [
     { label: 'Name', render: (person) => <><span className="avatar avatar-small">{getInitials(personName(person))}</span><span className="cell-primary"><strong>{personName(person)}</strong><small>{person.jobTitle ?? 'No title added'}</small></span></> },
@@ -262,8 +578,21 @@ const companiesDefinition: ResourceDefinition<CompanyRecord> = {
   emptyTitle: 'No companies in your workspace', emptyDescription: 'Add a company to connect people, opportunities, and notes in one place.',
   fields: [
     { name: 'name', label: 'Company name', required: true, placeholder: 'Company name' },
-    { name: 'domain', label: 'Website domain', placeholder: 'company.com' },
-    { name: 'description', label: 'Description', type: 'textarea', placeholder: 'What does this company do?' },
+    { name: 'domains', label: 'Domains', type: 'picker', multiple: true, allowCustom: true, placeholder: 'Add a domain and press Enter' },
+    { name: 'website', label: 'Website', type: 'url', placeholder: 'https://company.com' },
+    { name: 'links', label: 'Other links', type: 'links', wide: true },
+    { name: 'categories', label: 'Categories', type: 'picker', source: 'COMPANY_CATEGORY', multiple: true, allowCustom: true, placeholder: 'Search or add a category' },
+    { name: 'industries', label: 'Industries', type: 'picker', source: 'INDUSTRY', multiple: true, allowCustom: true, placeholder: 'Search or add an industry' },
+    { name: 'customerProfile', label: 'Customer profile', type: 'textarea', placeholder: 'Who does the company serve?' },
+    { name: 'businessRole', label: 'Business role', placeholder: 'e.g. Customer, partner, supplier' },
+    { name: 'ownerUserId', label: 'Owner', type: 'picker', source: 'users', placeholder: 'Search workspace members by name' },
+    { name: 'street', label: 'Street address', placeholder: 'Street and number' },
+    { name: 'city', label: 'City', placeholder: 'Budapest' },
+    { name: 'region', label: 'Region / state', placeholder: 'Pest' },
+    { name: 'postalCode', label: 'Postal code', placeholder: '1051' },
+    { name: 'countryName', label: 'Country', placeholder: 'Hungary' },
+    { name: 'countryCode', label: 'Country code', placeholder: 'HU' },
+    { name: 'description', label: 'Description', type: 'textarea', wide: true, placeholder: 'What does this company do?' },
   ],
   columns: [
     { label: 'Company', render: (company) => <><span className="avatar avatar-small company-avatar"><Building2 size={15} /></span><span className="cell-primary"><strong>{company.name}</strong><small>{company.domain ?? company.website ?? 'No website added'}</small></span></> },
@@ -280,11 +609,16 @@ const opportunityDefinition: ResourceDefinition<OpportunityRecord> = {
   emptyTitle: 'Your pipeline is clear', emptyDescription: 'Add your first opportunity to keep its stage, value, and next action visible.',
   fields: [
     { name: 'name', label: 'Opportunity name', required: true, placeholder: 'Opportunity name' },
-    { name: 'stage', label: 'Pipeline stage', options: ['LEAD', 'QUALIFIED', 'PROPOSAL', 'NEGOTIATION', 'WON', 'LOST'] },
+    { name: 'stage', label: 'Pipeline stage', type: 'picker', options: ['LEAD', 'QUALIFIED', 'PROPOSAL', 'NEGOTIATION', 'WON', 'LOST'] },
     { name: 'value', label: 'Value', type: 'number', placeholder: '0' },
     { name: 'currency', label: 'Currency', placeholder: 'EUR' },
     { name: 'expectedCloseDate', label: 'Expected close date', type: 'date' },
+    { name: 'nextFollowUpAt', label: 'Next follow-up date', type: 'date' },
     { name: 'nextAction', label: 'Next action', placeholder: 'What should happen next?' },
+    { name: 'companyIds', label: 'Companies', type: 'picker', source: 'companies', multiple: true, placeholder: 'Search companies by name' },
+    { name: 'personIds', label: 'People', type: 'picker', source: 'people', multiple: true, placeholder: 'Search people by name' },
+    { name: 'ownerUserId', label: 'Owner', type: 'picker', source: 'users', placeholder: 'Search workspace members by name' },
+    { name: 'description', label: 'Description', type: 'textarea', wide: true, placeholder: 'Context, scope, and success criteria' },
   ],
   columns: [
     { label: 'Opportunity', render: (opportunity) => <span className="cell-primary"><strong>{opportunity.name}</strong><small>{opportunity.companyName ?? opportunity.companies?.map(companyName).join(', ') ?? 'No company linked'}</small></span> },
@@ -302,8 +636,11 @@ const notesDefinition: ResourceDefinition<NoteRecord> = {
   emptyTitle: 'No notes just yet', emptyDescription: 'Capture a conversation or add context to make your shared history more useful.',
   fields: [
     { name: 'title', label: 'Title', required: true, placeholder: 'A short, descriptive title' },
-    { name: 'noteType', label: 'Note type', options: ['GENERAL', 'MEETING'] },
-    { name: 'bodyMarkdown', label: 'Note', type: 'textarea', placeholder: 'Write your note…' },
+    { name: 'noteType', label: 'Note type', type: 'picker', options: ['GENERAL', 'MEETING'] },
+    { name: 'bodyMarkdown', label: 'Note (Markdown)', type: 'markdown', wide: true, placeholder: 'Write your note…' },
+    { name: 'personIds', label: 'People', type: 'picker', source: 'people', multiple: true, placeholder: 'Search people by name' },
+    { name: 'companyIds', label: 'Companies', type: 'picker', source: 'companies', multiple: true, placeholder: 'Search companies by name' },
+    { name: 'opportunityIds', label: 'Opportunities', type: 'picker', source: 'opportunities', multiple: true, placeholder: 'Search opportunities by name' },
   ],
   columns: [
     { label: 'Note', render: (note) => <span className="cell-primary"><strong>{note.title}</strong><small className="note-preview">{note.bodyMarkdown ?? note.body ?? 'No preview available'}</small></span> },
@@ -328,7 +665,8 @@ const followUpFormDefinition: ResourceFormDefinition = {
   resource: 'follow-ups', singular: 'Follow-up', fields: [
     { name: 'title', label: 'Follow-up', required: true, placeholder: 'Send the proposal' },
     { name: 'dueAt', label: 'Due', type: 'datetime-local', required: true },
-    { name: 'assigneeUserId', label: 'Assignee user ID', placeholder: 'Optional workspace member ID' },
+    { name: 'relatedRecordIds', label: 'Follow up with / about', type: 'picker', source: 'records', multiple: true, placeholder: 'Search people, companies, or opportunities' },
+    { name: 'assigneeUserId', label: 'Assignee', type: 'picker', source: 'users', placeholder: 'Search workspace members by name' },
     { name: 'body', label: 'Details', type: 'textarea', placeholder: 'Context or next step' },
   ],
 }
@@ -349,6 +687,12 @@ function useWorkflowResource<T>(loader: () => Promise<T[]>) {
     }).finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [loader, refreshToken])
+
+  useEffect(() => {
+    const refresh = () => reload()
+    window.addEventListener('resoloon:workflow-refresh', refresh)
+    return () => window.removeEventListener('resoloon:workflow-refresh', refresh)
+  }, [reload])
 
   return { records, loading, error, reload }
 }
@@ -491,7 +835,7 @@ function FollowUpsPage() {
         return <article className={`workflow-card ${overdue ? 'workflow-card-overdue' : ''}`} key={record.id}>
           <div className="workflow-card-heading"><div><span className="eyebrow">{record.source ? statusText(record.source) : 'FOLLOW-UP'}</span><h3>{record.title ?? 'Untitled follow-up'}</h3></div><span className={`workflow-status ${statusClass(overdue ? 'OVERDUE' : record.status)}`}>{overdue ? 'Overdue' : statusText(record.status)}</span></div>
           {record.body && <p className="workflow-description">{record.body}</p>}
-          <div className="workflow-card-meta"><span><Clock3 size={13} />Due {formatDateTime(dueAt)}</span><span><UsersRound size={13} />{related}</span>{(record.assigneeName ?? record.assigneeUserId) && <span>Assigned to {record.assigneeName ?? record.assigneeUserId}</span>}</div>
+          <div className="workflow-card-meta"><span><Clock3 size={13} />Due {formatDateTime(dueAt)}</span><span><UsersRound size={13} />{related}</span>{(record.assigneeName ?? record.assigneeUserId) && <span>Assigned to {record.assigneeName ?? 'a workspace member'}</span>}</div>
           {isOpen && <div className="workflow-card-actions"><button type="button" className="button button-ghost button-small" disabled={pendingId === record.id} onClick={() => void changeStatus(record, 'COMPLETED')}>{pendingId === record.id ? <LoaderCircle size={13} className="spin" /> : <Check size={13} />}Complete</button><button type="button" className="button button-ghost button-small danger-action" disabled={pendingId === record.id} onClick={() => void changeStatus(record, 'CANCELLED')}>Cancel</button></div>}
         </article>
       })}
@@ -502,6 +846,11 @@ function FollowUpsPage() {
 
 function IntroductionFormDialog({ people, peopleLoading, onClose, onSaved }: { people: PersonRecord[]; peopleLoading: boolean; onClose: () => void; onSaved: () => void }) {
   const [stepCount, setStepCount] = useState(1)
+  const [target, setTarget] = useState<LookupOption[]>([])
+  const [owner, setOwner] = useState<LookupOption[]>([])
+  const [fromPeople, setFromPeople] = useState<LookupOption[][]>([[]])
+  const [toPeople, setToPeople] = useState<LookupOption[][]>([[]])
+  const [responsibleUsers, setResponsibleUsers] = useState<LookupOption[][]>([[]])
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -509,20 +858,21 @@ function IntroductionFormDialog({ people, peopleLoading, onClose, onSaved }: { p
     event.preventDefault()
     setError(null)
     const form = new FormData(event.currentTarget)
-    const targetPersonId = String(form.get('targetPersonId') ?? '').trim()
+    const targetPersonId = target[0]?.id ?? ''
+    if (!targetPersonId) { setError('Choose a target person by name.'); return }
     const steps = Array.from({ length: stepCount }, (_, index) => {
-      const fromPersonId = String(form.get(`steps.${index}.fromPersonId`) ?? '').trim()
-      const toPersonId = String(form.get(`steps.${index}.toPersonId`) ?? '').trim()
-      const responsibleUserId = String(form.get(`steps.${index}.responsibleUserId`) ?? '').trim()
+      const fromPersonId = fromPeople[index]?.[0]?.id ?? ''
+      const toPersonId = toPeople[index]?.[0]?.id ?? ''
+      const responsibleUserId = responsibleUsers[index]?.[0]?.id ?? ''
       const notes = String(form.get(`steps.${index}.notes`) ?? '').trim()
       const followUpDate = String(form.get(`steps.${index}.followUpAt`) ?? '').trim()
       const followUpAt = followUpDate ? workspaceDateTimeToIso(`${followUpDate}T12:00`) : undefined
       return { position: index + 1, ...(fromPersonId ? { fromPersonId } : {}), toPersonId, ...(responsibleUserId ? { responsibleUserId } : {}), status: 'PENDING', ...(notes ? { notes } : {}), ...(followUpAt ? { followUpAt } : {}) }
     })
-    if (steps.some((step) => !step.toPersonId)) { setError('Add a destination person ID for each step.'); return }
+    if (steps.some((step) => !step.toPersonId)) { setError('Choose a next person for each step.'); return }
     setPending(true)
     try {
-      await api.createIntroduction({ targetPersonId, ...(String(form.get('ownerUserId') ?? '').trim() ? { ownerUserId: String(form.get('ownerUserId')).trim() } : {}), steps })
+      await api.createIntroduction({ targetPersonId, ...(owner[0]?.id ? { ownerUserId: owner[0].id } : {}), steps })
       onSaved()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Unable to create this introduction.')
@@ -535,10 +885,10 @@ function IntroductionFormDialog({ people, peopleLoading, onClose, onSaved }: { p
     <div className="modal-header"><div><div className="eyebrow">RELATIONSHIP DEVELOPMENT</div><h2 id="intro-form-title">Plan a warm introduction</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={16} /></button></div>
     <form className="form-body" onSubmit={submit}>
       <p className="dialog-hint">Build an ordered path through people in your CRM. The first step can start with your team.</p>
-      <div className="form-grid"><label className="form-field"><span>Target person <b className="required-mark"> *</b></span><select name="targetPersonId" required disabled={peopleLoading || people.length === 0}><option value="">{peopleLoading ? 'Loading people…' : people.length ? 'Choose a person' : 'No people available'}</option>{people.map((person) => <option key={person.id} value={person.id}>{personName(person)}</option>)}</select></label><label className="form-field"><span>Chain owner user ID</span><input name="ownerUserId" placeholder="Optional workspace member ID" /></label></div>
+      <div className="form-grid"><label className="form-field"><span>Target person <b className="required-mark"> *</b></span><SearchablePicker label="Target person" selected={target} onChange={setTarget} source="people" placeholder="Search people by name" /></label><label className="form-field"><span>Chain owner</span><SearchablePicker label="Chain owner" selected={owner} onChange={setOwner} source="users" placeholder="Search workspace members" /></label></div>
       {!peopleLoading && people.length === 0 && <p className="dialog-hint">Add a person before planning an introduction. <Link to="/people" className="one-time-link-open">Open people</Link></p>}
-      {Array.from({ length: stepCount }, (_, index) => <fieldset className="intro-step" key={index}><legend>Step {index + 1}</legend><div className="form-grid"><label className="form-field"><span>Introducer{index === 0 ? ' (leave blank for team)' : ''}</span><select name={`steps.${index}.fromPersonId`} defaultValue=""><option value="">{index === 0 ? 'Your team' : 'Choose a person (optional)'}</option>{people.map((person) => <option key={person.id} value={person.id}>{personName(person)}</option>)}</select></label><label className="form-field"><span>Next person <b className="required-mark"> *</b></span><select name={`steps.${index}.toPersonId`} required disabled={peopleLoading || people.length === 0}><option value="">Choose a person</option>{people.map((person) => <option key={person.id} value={person.id}>{personName(person)}</option>)}</select></label><label className="form-field"><span>Responsible member ID</span><input name={`steps.${index}.responsibleUserId`} placeholder="Optional workspace member ID" /></label><label className="form-field"><span>Follow-up date</span><input name={`steps.${index}.followUpAt`} type="date" /></label></div><label className="form-field"><span>Step notes</span><textarea name={`steps.${index}.notes`} rows={2} placeholder="Context or the ask for this introduction" /></label></fieldset>)}
-      <button type="button" className="button button-ghost button-small add-step-button" disabled={stepCount >= 5} onClick={() => setStepCount((count) => Math.min(5, count + 1))}><Plus size={13} />Add another step</button>
+      {Array.from({ length: stepCount }, (_, index) => <fieldset className="intro-step" key={index}><legend>Step {index + 1}</legend><div className="form-grid"><label className="form-field"><span>Introducer{index === 0 ? ' (leave blank for team)' : ''}</span><SearchablePicker label={`Step ${index + 1} introducer`} selected={fromPeople[index] ?? []} onChange={(items) => setFromPeople((current) => current.map((item, itemIndex) => itemIndex === index ? items : item))} source="people" placeholder={index === 0 ? 'Your team (or choose a person)' : 'Search people by name'} /></label><label className="form-field"><span>Next person <b className="required-mark"> *</b></span><SearchablePicker label={`Step ${index + 1} next person`} selected={toPeople[index] ?? []} onChange={(items) => setToPeople((current) => current.map((item, itemIndex) => itemIndex === index ? items : item))} source="people" placeholder="Search people by name" /></label><label className="form-field"><span>Responsible member</span><SearchablePicker label={`Step ${index + 1} responsible member`} selected={responsibleUsers[index] ?? []} onChange={(items) => setResponsibleUsers((current) => current.map((item, itemIndex) => itemIndex === index ? items : item))} source="users" placeholder="Search workspace members" /></label><div className="form-field"><span>Follow-up date</span><DateQuickInput name={`steps.${index}.followUpAt`} label={`Step ${index + 1} follow-up date`} /></div></div><label className="form-field"><span>Step notes</span><textarea name={`steps.${index}.notes`} rows={2} placeholder="Context or the ask for this introduction" /></label></fieldset>)}
+      <button type="button" className="button button-ghost button-small add-step-button" disabled={stepCount >= 5} onClick={() => { const next = stepCount + 1; setStepCount(Math.min(5, next)); setFromPeople((current) => [...current, []]); setToPeople((current) => [...current, []]); setResponsibleUsers((current) => [...current, []]) }}><Plus size={13} />Add another step</button>
       {error && <div className="form-error" role="alert">{error}</div>}
       <div className="modal-actions"><button type="button" className="button button-ghost" onClick={onClose} disabled={pending}>Cancel</button><button type="submit" className="button button-primary" disabled={pending}>{pending ? <LoaderCircle size={15} className="spin" /> : <GitBranch size={15} />}Create introduction</button></div>
     </form>
@@ -587,12 +937,12 @@ function IntroductionsPage() {
       {records.map((record) => {
         const steps = Array.isArray(record.steps) ? [...record.steps].sort((left, right) => (left.position ?? 0) - (right.position ?? 0)) : []
         return <article className="workflow-card" key={record.id}>
-          <div className="workflow-card-heading"><div><span className="eyebrow">INTRODUCTION CHAIN</span><h3>{record.targetPersonName ?? (record.targetPersonId ? peopleById.get(record.targetPersonId) ?? `Target · ${record.targetPersonId}` : 'Target person not set')}</h3></div><span className={`workflow-status ${statusClass(record.status)}`}>{statusText(record.status ?? 'ACTIVE')}</span></div>
-          <p className="workflow-intro-owner">{record.ownerName ? `Owned by ${record.ownerName}` : record.ownerUserId ? `Owner · ${record.ownerUserId}` : 'Shared relationship workflow'}{record.currentStep ? ` · Current step ${record.currentStep}` : ''}</p>
+          <div className="workflow-card-heading"><div><span className="eyebrow">INTRODUCTION CHAIN</span><h3>{record.targetPersonName ?? (record.targetPersonId ? peopleById.get(record.targetPersonId) ?? 'Target person' : 'Target person not set')}</h3></div><span className={`workflow-status ${statusClass(record.status)}`}>{statusText(record.status ?? 'ACTIVE')}</span></div>
+          <p className="workflow-intro-owner">{record.ownerName ? `Owned by ${record.ownerName}` : record.ownerUserId ? 'Owned by a workspace member' : 'Shared relationship workflow'}{record.currentStep ? ` · Current step ${record.currentStep}` : ''}</p>
           {steps.length ? <ol className="intro-path">{steps.map((step, index) => {
             const stepKey = `${record.id}-${step.id ?? step.position ?? ''}`
             const stepStatus = (step.status ?? 'PENDING').toUpperCase()
-            return <li key={step.id ?? `${record.id}-${step.position ?? index}`}><span className="intro-step-number">{step.position ?? index + 1}</span><div className="intro-step-copy"><strong>{step.fromPersonName ?? (step.fromPersonId ? peopleById.get(step.fromPersonId) ?? `Person · ${step.fromPersonId}` : 'Your team')} <ArrowUpRight size={12} /> {step.toPersonName ?? (step.toPersonId ? peopleById.get(step.toPersonId) ?? `Person · ${step.toPersonId}` : 'Next person')}</strong><small>{step.notes || (step.followUpAt ? `Follow up ${formatDate(step.followUpAt)}` : 'No step notes')}</small></div><span className={`workflow-status ${statusClass(step.status)}`}>{statusText(step.status ?? 'PENDING')}</span>{stepStatus === 'PENDING' && <button type="button" className="button button-ghost button-small intro-step-action" disabled={pendingStep === stepKey} onClick={() => void updateStep(record, step, 'REQUESTED')}>{pendingStep === stepKey ? <LoaderCircle size={12} className="spin" /> : null}Request intro</button>}{stepStatus === 'REQUESTED' && <button type="button" className="button button-ghost button-small intro-step-action" disabled={pendingStep === stepKey} onClick={() => void updateStep(record, step, 'INTRODUCED')}>{pendingStep === stepKey ? <LoaderCircle size={12} className="spin" /> : <Check size={12} />}Mark introduced</button>}</li>
+            return <li key={step.id ?? `${record.id}-${step.position ?? index}`}><span className="intro-step-number">{step.position ?? index + 1}</span><div className="intro-step-copy"><strong>{step.fromPersonName ?? (step.fromPersonId ? peopleById.get(step.fromPersonId) ?? 'Person' : 'Your team')} <ArrowUpRight size={12} /> {step.toPersonName ?? (step.toPersonId ? peopleById.get(step.toPersonId) ?? 'Person' : 'Next person')}</strong><small>{step.notes || (step.followUpAt ? `Follow up ${formatDate(step.followUpAt)}` : 'No step notes')}</small></div><span className={`workflow-status ${statusClass(step.status)}`}>{statusText(step.status ?? 'PENDING')}</span>{stepStatus === 'PENDING' && <button type="button" className="button button-ghost button-small intro-step-action" disabled={pendingStep === stepKey} onClick={() => void updateStep(record, step, 'REQUESTED')}>{pendingStep === stepKey ? <LoaderCircle size={12} className="spin" /> : null}Request intro</button>}{stepStatus === 'REQUESTED' && <button type="button" className="button button-ghost button-small intro-step-action" disabled={pendingStep === stepKey} onClick={() => void updateStep(record, step, 'INTRODUCED')}>{pendingStep === stepKey ? <LoaderCircle size={12} className="spin" /> : <Check size={12} />}Mark introduced</button>}</li>
           })}</ol> : <p className="workflow-note">No steps have been added to this chain yet.</p>}
         </article>
       })}
@@ -630,7 +980,7 @@ function MeetingNoteActionDialog({ record, mode, onClose, onSaved }: { record: M
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="meeting-note-action-title">
     <div className="modal-header"><div><div className="eyebrow">{mode === 'complete' ? 'MEETING RECAP' : 'CANCEL REQUIREMENT'}</div><h2 id="meeting-note-action-title">{mode === 'complete' ? 'Complete meeting note' : 'Cancel meeting note'}</h2><p className="dialog-hint">{title}</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={16} /></button></div>
     <form className="form-body" onSubmit={submit}>
-      {mode === 'complete' ? <><label className="form-field"><span>Meeting summary <b className="required-mark"> *</b></span><textarea name="summary" rows={4} required defaultValue={record.summary ?? ''} placeholder="What was discussed?" /></label><label className="form-field"><span>Next steps</span><textarea name="nextStepsMarkdown" rows={3} defaultValue={record.nextStepsMarkdown ?? ''} placeholder="Actions, owners, and decisions" /></label><label className="form-field"><span>Follow-up date</span><input name="followUpDate" type="date" defaultValue={record.followUpDate?.slice(0, 10) ?? ''} /></label></> : <label className="form-field"><span>Cancellation reason <b className="required-mark"> *</b></span><textarea name="reason" rows={3} required placeholder="Why is this note no longer required?" /></label>}
+      {mode === 'complete' ? <><label className="form-field"><span>Meeting summary <b className="required-mark"> *</b></span><textarea name="summary" rows={4} required defaultValue={record.summary ?? ''} placeholder="What was discussed?" /></label><label className="form-field"><span>Next steps</span><textarea name="nextStepsMarkdown" rows={3} defaultValue={record.nextStepsMarkdown ?? ''} placeholder="Actions, owners, and decisions" /></label><div className="form-field"><span>Follow-up date</span><DateQuickInput name="followUpDate" label="Follow-up date" defaultValue={record.followUpDate?.slice(0, 10) ?? ''} /></div></> : <label className="form-field"><span>Cancellation reason <b className="required-mark"> *</b></span><textarea name="reason" rows={3} required placeholder="Why is this note no longer required?" /></label>}
       {error && <div className="form-error" role="alert">{error}</div>}
       <div className="modal-actions"><button type="button" className="button button-ghost" onClick={onClose} disabled={pending}>Keep open</button><button type="submit" className={`button ${mode === 'complete' ? 'button-primary' : 'button-ghost danger-action'}`} disabled={pending}>{pending ? <LoaderCircle size={15} className="spin" /> : mode === 'complete' ? <Check size={15} /> : null}{mode === 'complete' ? 'Complete note' : 'Cancel requirement'}</button></div>
     </form>
@@ -673,8 +1023,15 @@ const navItems = [
   { to: '/notes', label: 'Notes & meetings', icon: FileText },
 ]
 
+function BrandLogo({ className = '' }: { className?: string }) {
+  const [unavailable, setUnavailable] = useState(false)
+  return unavailable
+    ? <span className="brand-mark" aria-label="Resoloon"><span /></span>
+    : <img className={`brand-wordmark ${className}`} src="/resoloon_light_long_logo_-_no_ballon.svg" alt="Resoloon" onError={() => setUnavailable(true)} />
+}
+
 function AuthBrand() {
-  return <div className="auth-brand"><span className="brand-mark"><span /></span><span className="brand-name">resoloon<span>CRM</span></span></div>
+  return <div className="auth-brand"><BrandLogo className="brand-wordmark-auth" /><span className="brand-product-label">CRM</span></div>
 }
 
 function LoginPage({ onAuthenticated }: { onAuthenticated: (user: UserIdentity) => void }) {
@@ -769,6 +1126,7 @@ function AccessDeniedPage() {
 function UserFormDialog({ user, onClose, onSaved }: { user?: AdminUser; onClose: () => void; onSaved: (created?: { user: AdminUser; setupUrl: string }) => void }) {
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [role, setRole] = useState<LookupOption[]>([{ id: user?.role ?? 'USER', label: user?.role === 'ADMIN' ? 'Administrator' : 'User' }])
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -778,7 +1136,7 @@ function UserFormDialog({ user, onClose, onSaved }: { user?: AdminUser; onClose:
     const values = {
       fullName: String(form.get('fullName') ?? '').trim(),
       email: String(form.get('email') ?? '').trim(),
-      role: String(form.get('role') ?? 'USER') as 'ADMIN' | 'USER',
+      role: (role[0]?.id ?? 'USER') as 'ADMIN' | 'USER',
     }
     try {
       if (user) {
@@ -799,7 +1157,7 @@ function UserFormDialog({ user, onClose, onSaved }: { user?: AdminUser; onClose:
     <form className="form-body" onSubmit={submit}>
       <label className="form-field" htmlFor="user-full-name"><span>Full name</span><input id="user-full-name" name="fullName" autoComplete="name" maxLength={200} required defaultValue={user?.fullName ?? ''} /></label>
       <label className="form-field" htmlFor="user-email"><span>Email address</span><input id="user-email" name="email" type="email" autoComplete="email" maxLength={320} required defaultValue={user?.email ?? ''} /></label>
-      <label className="form-field" htmlFor="user-role"><span>Role</span><select id="user-role" name="role" defaultValue={user?.role ?? 'USER'}><option value="USER">User</option><option value="ADMIN">Administrator</option></select></label>
+      <label className="form-field"><span>Role</span><SearchablePicker label="Role" selected={role} onChange={setRole} options={[{ id: 'USER', label: 'User' }, { id: 'ADMIN', label: 'Administrator' }]} /></label>
       {!user && <p className="dialog-hint">A single-use setup link will be created for this person.</p>}
       {error && <div className="form-error" role="alert">{error}</div>}
       <div className="modal-actions"><button type="button" className="button button-ghost" onClick={onClose} disabled={pending}>Cancel</button><button type="submit" className="button button-primary" disabled={pending}>{pending ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}{user ? 'Save changes' : 'Create user'}</button></div>
@@ -909,6 +1267,9 @@ export default function App() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [logoutMessage, setLogoutMessage] = useState<string | null>(null)
   const [logoutPending, setLogoutPending] = useState(false)
+  const [undoNotice, setUndoNotice] = useState<{ token: string; label: string } | null>(null)
+  const [undoPending, setUndoPending] = useState(false)
+  const [undoError, setUndoError] = useState<string | null>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const location = useLocation()
   const navigate = useNavigate()
@@ -936,6 +1297,46 @@ export default function App() {
     setMobileNav(false)
     setSearchOpen(false)
   }, [location.pathname])
+
+  useEffect(() => {
+    const announce = (event: Event) => {
+      const detail = (event as CustomEvent<{ token: string; label: string }>).detail
+      if (detail?.token) { setUndoNotice(detail); setUndoError(null) }
+    }
+    window.addEventListener('resoloon:undo-available', announce)
+    return () => window.removeEventListener('resoloon:undo-available', announce)
+  }, [])
+
+  const undoLastAction = useCallback(async () => {
+    if (!undoNotice || undoPending) return
+    setUndoPending(true)
+    setUndoError(null)
+    try {
+      await api.undo(undoNotice.token)
+      setUndoNotice(null)
+      window.dispatchEvent(new Event('resoloon:workflow-refresh'))
+      setLogoutMessage('The last workflow action was restored.')
+      window.setTimeout(() => setLogoutMessage(null), 4000)
+    } catch (reason) {
+      setUndoError(reason instanceof Error ? reason.message : 'Unable to undo that action.')
+    } finally {
+      setUndoPending(false)
+    }
+  }, [undoNotice, undoPending])
+
+  useEffect(() => {
+    if (!undoNotice) return
+    function handleUndoShortcut(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null
+      const editingText = !!target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z' && !editingText) {
+        event.preventDefault()
+        void undoLastAction()
+      }
+    }
+    window.addEventListener('keydown', handleUndoShortcut)
+    return () => window.removeEventListener('keydown', handleUndoShortcut)
+  }, [undoNotice, undoLastAction])
 
   useEffect(() => {
     function handleShortcut(event: KeyboardEvent) {
@@ -1002,7 +1403,7 @@ export default function App() {
   return <div className="app-shell">
     {mobileNav && <button aria-label="Close navigation" className="mobile-scrim" onClick={() => setMobileNav(false)} />}
     <aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}>
-      <div className="brand-row"><span className="brand-mark"><span /></span><span className="brand-name">resoloon<span>CRM</span></span><button className="icon-button sidebar-close" aria-label="Close navigation" onClick={() => setMobileNav(false)}><X size={16} /></button></div>
+      <div className="brand-row"><BrandLogo /><span className="brand-product-label">CRM</span><button className="icon-button sidebar-close" aria-label="Close navigation" onClick={() => setMobileNav(false)}><X size={16} /></button></div>
       <div className="workspace-switcher"><span className="workspace-monogram">R</span><span><strong>Resoloon</strong><small>Shared workspace</small></span><ChevronDown size={14} /></div>
       <div className="nav-section-label">WORKSPACE</div>
       <nav className="primary-nav" aria-label="Main navigation">{navItems.map(({ to, label, icon: Icon, end }) => <NavLink key={to} to={to} end={end} className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}><Icon size={16} /><span>{label}</span>{label === 'Opportunities' && <span className="nav-arrow">↗</span>}</NavLink>)}{isAdmin && <NavLink to="/admin/users" className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}><ShieldCheck size={16} /><span>User management</span></NavLink>}</nav>
@@ -1010,7 +1411,7 @@ export default function App() {
     </aside>
 
     <div className="main-column">
-      <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={18} /></button><div className="mobile-brand"><span className="brand-mark"><span /></span>Resoloon</div>
+      <header className="topbar"><button className="icon-button mobile-menu" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={18} /></button><div className="mobile-brand"><BrandLogo className="brand-wordmark-mobile" /><span className="brand-product-label">CRM</span></div>
         <form className="global-search" onSubmit={submitSearch} role="search"><Search size={15} /><input ref={searchInputRef} value={searchValue} onChange={(event) => { setSearchValue(event.target.value); setSearchOpen(true) }} onFocus={() => setSearchOpen(true)} onKeyDown={(event) => { if (event.key === 'Escape') setSearchOpen(false) }} placeholder="Search people, companies, notes…" aria-label="Search workspace" /><kbd>⌘ K</kbd>
           {searchOpen && searchValue.trim().length >= 2 && <div className="search-popover"><div className="search-popover-heading"><span>SEARCH RESULTS</span><span>{searching ? <LoaderCircle className="spin" size={13} /> : `${searchResults.length} found`}</span></div>{searchError ? <div className="search-hint error-text">{searchError}</div> : searchResults.length ? searchResults.map((result) => <button type="button" key={`${result.recordType}-${result.id}`} className="search-result" onClick={() => { setSearchOpen(false); navigate(recordPath(result.recordType ?? result.type, result.id)) }}><span className="search-result-icon"><Search size={13} /></span><span><strong>{result.title ?? result.name ?? 'Untitled record'}</strong><small>{result.subtitle ?? result.description ?? result.recordType ?? result.type ?? 'CRM record'}</small></span><ArrowUpRight size={13} /></button>) : !searching && <div className="search-hint">No matching records yet. Press enter to view full search.</div>}<button type="submit" className="search-all">Search all records <ArrowUpRight size={13} /></button></div>}
         </form>
@@ -1031,7 +1432,8 @@ export default function App() {
         <Route path="/:resource/:id" element={<RecordDetailPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Routes></div></main>
-      {logoutMessage && <div role="status" className="toast"><Check size={15} />{logoutMessage}</div>}
+       {logoutMessage && <div role="status" className="toast"><Check size={15} />{logoutMessage}</div>}
+       {undoNotice && <div role="status" className="toast undo-toast"><span>{undoError ?? `${undoNotice.label} · ${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl+'}Z to undo`}</span><button type="button" className="button button-ghost button-small" disabled={undoPending} onClick={() => void undoLastAction()}>{undoPending ? 'Restoring…' : 'Undo'}</button><button type="button" className="undo-dismiss" aria-label="Dismiss undo notice" onClick={() => setUndoNotice(null)}><X size={13} /></button></div>}
     </div>
   </div>
 }
@@ -1088,7 +1490,6 @@ function RecordDetailPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [token, setToken] = useState(0)
-  const [editOpen, setEditOpen] = useState(false)
   const navigate = useNavigate()
   const safeResource = ['people', 'companies', 'opportunities', 'notes'].includes(resource) ? resource : null
 
@@ -1105,12 +1506,14 @@ function RecordDetailPage() {
   return <section className="page-stack">
     <button type="button" className="back-link" onClick={() => navigate(safeResource ? `/${safeResource}` : '/')}><ArrowLeft size={14} />Back to {pageTitle.toLowerCase()}</button>
     {loading ? <LoadingState label="Loading record…" /> : error ? <ErrorState message={error} onRetry={() => setToken((value) => value + 1)} /> : record ? <div className="detail-panel">
-      <div className="detail-heading"><div><div className="eyebrow">{pageTitle.toUpperCase()} / RECORD</div><h1>{String(record.fullName ?? record.name ?? record.title ?? 'Record')}</h1></div><div className="detail-actions">{record.stage != null && <StagePill stage={String(record.stage)} />}{formDefinition && <button type="button" className="button button-ghost button-small" onClick={() => setEditOpen(true)}>Edit record</button>}</div></div>
+      <div className="detail-heading"><div><div className="eyebrow">{pageTitle.toUpperCase()} / EDITING</div><h1>{String(record.fullName ?? record.name ?? record.title ?? 'Record')}</h1><p className="detail-subtitle">Changes save directly to this record. Related records are searchable by name.</p></div><div className="detail-actions">{record.stage != null && <StagePill stage={String(record.stage)} />}</div></div>
+      {formDefinition && <RecordEditorForm key={`${id}-${token}`} definition={formDefinition} record={record} inline onSave={async (values) => {
+        const updated = await api.update<Record<string, unknown>>(safeResource!, id, values)
+        setRecord(updated)
+        return updated
+      }} onSaved={() => {}} onReload={() => setToken((value) => value + 1)} />}
       {Array.isArray(record.introductionObligations) && record.introductionObligations.length > 0 && <section className="detail-description introduction-obligations"><span className="eyebrow">YOUR INTRODUCTION OBLIGATIONS</span>{(record.introductionObligations as Array<Record<string, unknown>>).map((obligation, index) => <p key={`${String(obligation.chainId ?? index)}-${String(obligation.position ?? index)}`}>Introduce <strong>{String(obligation.targetPersonName ?? 'the next person')}</strong>{obligation.followUpAt ? ` · follow up ${formatDate(String(obligation.followUpAt))}` : ''}{obligation.notes ? ` · ${String(obligation.notes)}` : ''}</p>)}<Link to="/introductions" className="one-time-link-open">Open introduction chains</Link></section>}
-      <div className="detail-fields">{Object.entries(record).filter(([key, value]) => key !== 'id' && key !== 'introductionObligations' && value != null && (typeof value !== 'object' || Array.isArray(value))).map(([key, value]) => <div className="detail-field" key={key}><span>{key.replace(/([A-Z])/g, ' $1').replace(/^./, (letter) => letter.toUpperCase())}</span><strong>{Array.isArray(value) ? value.map((item) => typeof item === 'object' && item !== null ? String((item as Record<string, unknown>).name ?? (item as Record<string, unknown>).fullName ?? (item as Record<string, unknown>).email ?? '') : String(item)).filter(Boolean).join(', ') || '—' : String(value)}</strong></div>)}</div>
-      {record.description != null && <div className="detail-description"><span className="eyebrow">ABOUT</span><p>{String(record.description)}</p></div>}
     </div> : null}
-    {editOpen && record && formDefinition && <RecordFormDialog definition={formDefinition} record={record} onClose={() => setEditOpen(false)} onSaved={() => { setEditOpen(false); setToken((value) => value + 1) }} />}
   </section>
 }
 

@@ -37,6 +37,7 @@ export type FollowUpStatus = 'OPEN' | 'COMPLETED' | 'CANCELLED'
 export type FollowUpSource = string
 export type ReminderStatus = 'SCHEDULED' | 'DELIVERED' | 'DISMISSED' | 'CANCELLED' | 'FAILED'
 export type IntroductionChainStatus = 'ACTIVE' | 'COMPLETED' | 'CANCELLED'
+export type UndoableWorkflowActionType = 'FOLLOW_UP_STATUS' | 'MEETING_NOTE_STATUS'
 export type IntroductionStepStatus =
   | 'PLANNED'
   | 'PENDING'
@@ -341,6 +342,10 @@ export interface TaxonomyTermsTable {
   taxonomy: TaxonomyType
   label: string
   normalized_label: string
+  color: Generated<string>
+  description: Nullable<string>
+  is_active: Generated<boolean>
+  sort_order: Generated<number>
   created_at: Timestamp
 }
 
@@ -619,6 +624,22 @@ export interface OutboxEventsTable {
   last_error: Nullable<string>
 }
 
+export interface UndoableWorkflowActionsTable {
+  id: Generated<UUID>
+  workspace_id: UUID
+  actor_id: UUID
+  action_type: UndoableWorkflowActionType
+  /** Polymorphic ID for the workflow target; deliberately has no target FK. */
+  target_id: UUID
+  before_state: JsonObject
+  after_state: JsonObject
+  request_id: Nullable<string>
+  created_at: Timestamp
+  expires_at: Timestamp
+  consumed_at: NullableTimestamp
+  consumed_by_actor_id: Nullable<UUID>
+}
+
 export interface SchemaMigrationsTable {
   filename: string
   sha256: string
@@ -670,5 +691,6 @@ export interface Database {
   activity_events: ActivityEventsTable
   activity_records: ActivityRecordsTable
   outbox_events: OutboxEventsTable
+  undoable_workflow_actions: UndoableWorkflowActionsTable
   schema_migrations: SchemaMigrationsTable
 }

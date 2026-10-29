@@ -213,6 +213,25 @@ async function writeActivity(
   )
 }
 
+async function storeUndoAction(
+  client: PoolClient,
+  user: AuthUser,
+  request: FastifyRequest,
+  actionType: 'FOLLOW_UP_STATUS' | 'MEETING_NOTE_STATUS',
+  targetId: string,
+  beforeState: Record<string, unknown>,
+  afterState: Record<string, unknown>,
+): Promise<string> {
+  const result = await client.query<{ id: string }>(
+    `INSERT INTO undoable_workflow_actions
+       (workspace_id, actor_id, action_type, target_id, before_state, after_state, request_id)
+     VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7) RETURNING id`,
+    [user.workspaceId, user.actorId, actionType, targetId, JSON.stringify(beforeState), JSON.stringify(afterState),
+      typeof request.id === 'string' ? request.id.slice(0, 200) : null],
+  )
+  return result.rows[0]!.id
+}
+
 function ensureTimeRange(start: string, end: string) {
   if (Date.parse(end) < Date.parse(start)) throw new HttpError(400, 'endAt must be on or after startAt.')
 }
@@ -601,8 +620,12 @@ export function registerWorkflowRoutes(app: FastifyInstance, { pool }: WorkflowO
     if (cancellationReason !== undefined && nextStatus !== 'CANCELLED') throw new HttpError(400, 'cancellationReason can only be supplied when cancelling a follow-up.')
     if (cancellationReason !== undefined) columns.push({ column: 'cancellation_reason', value: cancellationReason, field: 'cancellationReason' })
     if (!columns.length) throw new HttpError(400, 'At least one field to update is required.')
-    await transaction(pool, async (client) => {
-      const current = await client.query('SELECT status FROM follow_ups WHERE workspace_id=$1 AND id=$2 FOR UPDATE', [user.workspaceId, id])
+    const undoToken = await transaction(pool, async (client) => {
+      const current = await client.query(
+        `SELECT status, completed_at, completed_by_actor_id, cancelled_at, cancelled_by_actor_id, cancellation_reason
+           FROM follow_ups WHERE workspace_id=$1 AND id=$2 FOR UPDATE`,
+        [user.workspaceId, id],
+      )
       if (!current.rowCount) throw new HttpError(404, 'Follow-up not found.')
       if (current.rows[0].status !== 'OPEN') throw new HttpError(409, 'A completed or cancelled follow-up cannot be edited.')
       if (nextStatus && current.rows[0].status !== nextStatus) {
@@ -638,9 +661,18 @@ export function registerWorkflowRoutes(app: FastifyInstance, { pool }: WorkflowO
         )
       }
       await writeActivity(client, user, request, nextStatus === 'CANCELLED' ? 'FOLLOW_UP_CANCELLED' : nextStatus === 'COMPLETED' ? 'FOLLOW_UP_COMPLETED' : 'FOLLOW_UP_UPDATED', fields)
+      if (!nextStatus || !['COMPLETED', 'CANCELLED'].includes(nextStatus)) return null
+      return storeUndoAction(client, user, request, 'FOLLOW_UP_STATUS', id, {
+        status: current.rows[0].status,
+        completedAt: current.rows[0].completed_at,
+        completedByActorId: current.rows[0].completed_by_actor_id,
+        cancelledAt: current.rows[0].cancelled_at,
+        cancelledByActorId: current.rows[0].cancelled_by_actor_id,
+        cancellationReason: current.rows[0].cancellation_reason,
+      }, { status: nextStatus })
     })
     const result = await pool.query(`${FOLLOW_UP_SELECT} AND f.id=$2`, [user.workspaceId, id])
-    return reply.send(result.rows[0])
+    return reply.send({ ...result.rows[0], ...(undoToken ? { undoToken, undoLabel: nextStatus === 'COMPLETED' ? 'Follow-up completed' : 'Follow-up dismissed' } : {}) })
   }))
 
   app.delete('/api/v1/follow-ups/:id', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
@@ -819,11 +851,17 @@ export function registerWorkflowRoutes(app: FastifyInstance, { pool }: WorkflowO
       nextSteps !== undefined ? 'nextStepsMarkdown' : null, followUpDate !== undefined ? 'followUpDate' : null,
       status !== undefined ? 'status' : null, cancellationReason !== undefined ? 'cancellationReason' : null].filter((field): field is string => field !== null)
     if (!changed.length) throw new HttpError(400, 'At least one field to update is required.')
-    await transaction(pool, async (client) => {
+    const undoToken = await transaction(pool, async (client) => {
       const current = await client.query(
-        `SELECT mn.status, mn.event_id, e.title AS event_title, e.owner_user_id
-           FROM meeting_notes mn JOIN events e ON e.workspace_id=mn.workspace_id AND e.id=mn.event_id
-          WHERE mn.workspace_id=$1 AND mn.note_id=$2 FOR UPDATE OF mn`,
+        `SELECT mn.status, mn.event_id, e.title AS event_title, e.owner_user_id,
+                mn.summary, mn.next_steps_markdown, mn.follow_up_date, mn.cancellation_reason,
+                mn.completed_at, mn.completed_by_actor_id, mn.cancelled_at, mn.cancelled_by_actor_id,
+                n.title AS note_title, n.body_markdown, r.version
+           FROM meeting_notes mn
+           JOIN events e ON e.workspace_id=mn.workspace_id AND e.id=mn.event_id
+           JOIN notes n ON n.workspace_id=mn.workspace_id AND n.id=mn.note_id
+           JOIN records r ON r.workspace_id=mn.workspace_id AND r.id=mn.note_id
+          WHERE mn.workspace_id=$1 AND mn.note_id=$2 FOR UPDATE OF mn,n,r`,
         [user.workspaceId, id],
       )
       if (!current.rowCount) throw new HttpError(404, 'Meeting note not found.')
@@ -850,6 +888,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, { pool }: WorkflowO
       if (status || title !== undefined || summary !== undefined || nextSteps !== undefined || followUpDate !== undefined) {
         await client.query('UPDATE records SET version=version+1,updated_at=now(),updated_by_actor_id=$3 WHERE workspace_id=$1 AND id=$2', [user.workspaceId, id, user.actorId])
       }
+      let createdFollowUpId: string | null = null
       if (status === 'COMPLETED' && nextSteps?.trim() && followUpDate) {
         const existingFollowUp = await client.query(
           `SELECT id FROM follow_ups WHERE workspace_id=$1 AND source='MEETING_NOTE' AND source_meeting_note_id=$2 LIMIT 1`,
@@ -863,6 +902,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, { pool }: WorkflowO
              RETURNING id`,
             [user.workspaceId, `Follow up: ${current.rows[0].event_title}`, nextSteps, followUpDate, assignee, id, user.actorId],
           )
+          createdFollowUpId = followUp.rows[0]!.id
           await client.query(
             `INSERT INTO follow_up_records (workspace_id,follow_up_id,record_id,created_by_actor_id)
              SELECT $1::uuid,$2::uuid,$3::uuid,$4::uuid
@@ -876,8 +916,115 @@ export function registerWorkflowRoutes(app: FastifyInstance, { pool }: WorkflowO
         }
       }
       await writeActivity(client, user, request, status === 'COMPLETED' ? 'MEETING_NOTE_COMPLETED' : status === 'CANCELLED' ? 'MEETING_NOTE_CANCELLED' : 'MEETING_NOTE_UPDATED', changed, id)
+      if (status !== 'COMPLETED' && status !== 'CANCELLED') return null
+      const versionResult = await client.query<{ version: number }>(
+        'SELECT version FROM records WHERE workspace_id=$1 AND id=$2', [user.workspaceId, id],
+      )
+      return storeUndoAction(client, user, request, 'MEETING_NOTE_STATUS', id, {
+        status: current.rows[0].status,
+        summary: current.rows[0].summary,
+        nextStepsMarkdown: current.rows[0].next_steps_markdown,
+        followUpDate: current.rows[0].follow_up_date,
+        cancellationReason: current.rows[0].cancellation_reason,
+        completedAt: current.rows[0].completed_at,
+        completedByActorId: current.rows[0].completed_by_actor_id,
+        cancelledAt: current.rows[0].cancelled_at,
+        cancelledByActorId: current.rows[0].cancelled_by_actor_id,
+        title: current.rows[0].note_title,
+        bodyMarkdown: current.rows[0].body_markdown,
+      }, { status, recordVersion: versionResult.rows[0]!.version, followUpId: createdFollowUpId })
     })
     const result = await pool.query(`${MEETING_NOTE_SELECT} AND mn.note_id=$2`, [user.workspaceId, id])
-    return reply.send(result.rows[0])
+    return reply.send({ ...result.rows[0], ...(undoToken ? { undoToken, undoLabel: status === 'COMPLETED' ? 'Meeting note completed' : 'Meeting note dismissed' } : {}) })
+  }))
+
+  app.post('/api/v1/undo/:id', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
+    const undoId = recordId(request)
+    const result = await transaction(pool, async (client) => {
+      const actionResult = await client.query<{
+        id: string
+        action_type: 'FOLLOW_UP_STATUS' | 'MEETING_NOTE_STATUS'
+        target_id: string
+        before_state: Record<string, unknown>
+        after_state: Record<string, unknown>
+      }>(
+        `SELECT id, action_type, target_id, before_state, after_state
+           FROM undoable_workflow_actions
+          WHERE id=$1 AND workspace_id=$2 AND actor_id=$3
+            AND consumed_at IS NULL AND expires_at > now()
+          FOR UPDATE`,
+        [undoId, user.workspaceId, user.actorId],
+      )
+      const action = actionResult.rows[0]
+      if (!action) throw new HttpError(404, 'That action can no longer be undone.')
+
+      if (action.action_type === 'FOLLOW_UP_STATUS') {
+        const current = await client.query<{ status: string }>(
+          'SELECT status FROM follow_ups WHERE workspace_id=$1 AND id=$2 FOR UPDATE',
+          [user.workspaceId, action.target_id],
+        )
+        if (!current.rowCount || current.rows[0]!.status !== action.after_state.status) {
+          throw new HttpError(409, 'This follow-up has changed since the action and cannot be restored safely.')
+        }
+        const before = action.before_state
+        await client.query(
+          `UPDATE follow_ups SET status=$3, completed_at=$4, completed_by_actor_id=$5,
+                  cancelled_at=$6, cancelled_by_actor_id=$7, cancellation_reason=$8,
+                  updated_at=now(), updated_by_actor_id=$9
+            WHERE workspace_id=$1 AND id=$2`,
+          [user.workspaceId, action.target_id, before.status, before.completedAt ?? null, before.completedByActorId ?? null,
+            before.cancelledAt ?? null, before.cancelledByActorId ?? null, before.cancellationReason ?? null, user.actorId],
+        )
+        await writeActivity(client, user, request, 'FOLLOW_UP_STATUS_UNDONE', ['status', 'completionOrDismissal'], null)
+      } else if (action.action_type === 'MEETING_NOTE_STATUS') {
+        const current = await client.query<{ status: string; version: number }>(
+          `SELECT mn.status,r.version FROM meeting_notes mn JOIN records r ON r.workspace_id=mn.workspace_id AND r.id=mn.note_id
+            WHERE mn.workspace_id=$1 AND mn.note_id=$2 FOR UPDATE OF mn,r`,
+          [user.workspaceId, action.target_id],
+        )
+        if (!current.rowCount || current.rows[0]!.status !== action.after_state.status || Number(current.rows[0]!.version) !== Number(action.after_state.recordVersion)) {
+          throw new HttpError(409, 'This meeting note has changed since the action and cannot be restored safely.')
+        }
+        const before = action.before_state
+        const followUpId = typeof action.after_state.followUpId === 'string' ? action.after_state.followUpId : null
+        if (followUpId) {
+          const followUp = await client.query<{ status: string }>(
+            'SELECT status FROM follow_ups WHERE workspace_id=$1 AND id=$2 FOR UPDATE', [user.workspaceId, followUpId],
+          )
+          if (followUp.rowCount && followUp.rows[0]!.status !== 'OPEN') throw new HttpError(409, 'The generated follow-up has already changed; this meeting note cannot be undone safely.')
+          if (followUp.rowCount) {
+            await client.query(
+              `UPDATE follow_ups SET status='CANCELLED', cancellation_reason='Meeting note completion undone',
+                      cancelled_at=now(), cancelled_by_actor_id=$3, updated_at=now(), updated_by_actor_id=$3
+                WHERE workspace_id=$1 AND id=$2`,
+              [user.workspaceId, followUpId, user.actorId],
+            )
+          }
+        }
+        await client.query(
+          `UPDATE meeting_notes SET status=$3, summary=$4, next_steps_markdown=$5, follow_up_date=$6,
+                  cancellation_reason=$7, completed_at=$8, completed_by_actor_id=$9,
+                  cancelled_at=$10, cancelled_by_actor_id=$11, updated_at=now(), updated_by_actor_id=$12
+            WHERE workspace_id=$1 AND note_id=$2`,
+          [user.workspaceId, action.target_id, before.status, before.summary, before.nextStepsMarkdown, before.followUpDate,
+            before.cancellationReason, before.completedAt, before.completedByActorId, before.cancelledAt, before.cancelledByActorId, user.actorId],
+        )
+        await client.query(
+          'UPDATE notes SET title=$3, body_markdown=$4 WHERE workspace_id=$1 AND id=$2',
+          [user.workspaceId, action.target_id, before.title, before.bodyMarkdown],
+        )
+        await client.query(
+          'UPDATE records SET version=version+1, updated_at=now(), updated_by_actor_id=$3 WHERE workspace_id=$1 AND id=$2',
+          [user.workspaceId, action.target_id, user.actorId],
+        )
+        await writeActivity(client, user, request, 'MEETING_NOTE_STATUS_UNDONE', ['status', 'summary', 'nextStepsMarkdown'], action.target_id)
+      }
+      await client.query(
+        'UPDATE undoable_workflow_actions SET consumed_at=now(), consumed_by_actor_id=$3 WHERE workspace_id=$1 AND id=$2',
+        [user.workspaceId, undoId, user.actorId],
+      )
+      return { actionType: action.action_type, targetId: action.target_id }
+    })
+    return reply.send({ undone: true, ...result })
   }))
 }

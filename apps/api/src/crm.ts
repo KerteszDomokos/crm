@@ -20,7 +20,7 @@ class HttpError extends Error {
 }
 
 function statusTitle(status: number): string {
-  return ({ 400: 'Bad Request', 401: 'Unauthorized', 404: 'Not Found', 409: 'Conflict' } as Record<number, string>)[status]
+  return ({ 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 409: 'Conflict' } as Record<number, string>)[status]
     ?? 'Internal Server Error'
 }
 
@@ -77,6 +77,13 @@ function protectedHandler(handler: CrmHandler) {
       return sendProblem(reply, error)
     }
   }
+}
+
+function protectedAdminHandler(handler: CrmHandler) {
+  return protectedHandler(async (request, reply, user) => {
+    if (user.role !== 'ADMIN') throw new HttpError(403, 'Administrator access is required.')
+    return handler(request, reply, user)
+  })
 }
 
 function objectBody(request: FastifyRequest): JsonObject {
@@ -201,6 +208,115 @@ function normalizedPhone(value: unknown): { raw: string; e164: string | null } |
   return { raw, e164 }
 }
 
+function stringArray(body: JsonObject, key: string, label = key, maxItems = 100, maxLength = 2_000): { supplied: boolean; values: string[] } {
+  if (!has(body, key)) return { supplied: false, values: [] }
+  const raw = body[key]
+  if (raw === null) return { supplied: true, values: [] }
+  if (!Array.isArray(raw) || raw.length > maxItems) throw new HttpError(400, `${label} must be an array of at most ${maxItems} strings or null.`)
+  return {
+    supplied: true,
+    values: raw.map((value, index) => text(value, `${label}[${index}]`, { required: true, max: maxLength }) as string),
+  }
+}
+
+function emailArray(body: JsonObject): { supplied: boolean; values: Array<{ raw: string; normalized: string }> } {
+  if (has(body, 'emails')) {
+    const parsed = stringArray(body, 'emails', 'emails', 100, 320)
+    const values = parsed.values.map((value) => emailAddress(value) as { raw: string; normalized: string })
+    if (new Set(values.map((value) => value.normalized)).size !== values.length) throw new HttpError(400, 'emails must not contain duplicates.')
+    if (has(body, 'email')) {
+      const primary = emailAddress(body.email)
+      if (primary?.normalized !== values[0]?.normalized) throw new HttpError(400, 'email must match the primary entry in emails.')
+    }
+    return { supplied: true, values }
+  }
+  return has(body, 'email')
+    ? { supplied: true, values: [emailAddress(body.email)].filter((value): value is { raw: string; normalized: string } => !!value) }
+    : { supplied: false, values: [] }
+}
+
+function phoneArray(body: JsonObject): { supplied: boolean; values: Array<{ raw: string; e164: string | null }> } {
+  if (has(body, 'phones')) {
+    const parsed = stringArray(body, 'phones', 'phones', 100, 100)
+    const values = parsed.values.map((value) => normalizedPhone(value) as { raw: string; e164: string | null })
+    const e164 = values.flatMap((value) => value.e164 ? [value.e164] : [])
+    if (new Set(e164).size !== e164.length) throw new HttpError(400, 'phones must not contain duplicate E.164 numbers.')
+    if (has(body, 'phone')) {
+      const primary = normalizedPhone(body.phone)
+      if (primary?.raw !== values[0]?.raw) throw new HttpError(400, 'phone must match the primary entry in phones.')
+    }
+    return { supplied: true, values }
+  }
+  return has(body, 'phone')
+    ? { supplied: true, values: [normalizedPhone(body.phone)].filter((value): value is { raw: string; e164: string | null } => !!value) }
+    : { supplied: false, values: [] }
+}
+
+function urlArray(body: JsonObject, key: string): { supplied: boolean; values: Array<{ raw: string; canonical: string }> } {
+  const parsed = stringArray(body, key, key, 100, 2_000)
+  const values = parsed.values.map((value) => canonicalWebsite(value) as { raw: string; canonical: string })
+  if (new Set(values.map((value) => value.canonical)).size !== values.length) throw new HttpError(400, `${key} must not contain duplicate URLs.`)
+  return { supplied: parsed.supplied, values }
+}
+
+function domainArray(body: JsonObject): { supplied: boolean; values: Array<{ raw: string; normalized: string }> } {
+  if (has(body, 'domains')) {
+    const parsed = stringArray(body, 'domains', 'domains', 100, 2_000)
+    const values = parsed.values.map((value) => normalizedDomain(value) as { raw: string; normalized: string })
+    if (new Set(values.map((value) => value.normalized)).size !== values.length) throw new HttpError(400, 'domains must not contain duplicates.')
+    if (has(body, 'domain')) {
+      const primary = normalizedDomain(body.domain)
+      if (primary?.normalized !== values[0]?.normalized) throw new HttpError(400, 'domain must match the primary entry in domains.')
+    }
+    return { supplied: true, values }
+  }
+  return has(body, 'domain')
+    ? { supplied: true, values: [normalizedDomain(body.domain)].filter((value): value is { raw: string; normalized: string } => !!value) }
+    : { supplied: false, values: [] }
+}
+
+function taxonomyLabels(body: JsonObject, key: string): { supplied: boolean; values: string[] } {
+  const parsed = stringArray(body, key, key, 100, 200)
+  const values = parsed.values
+  if (new Set(values.map((value) => value.toLowerCase())).size !== values.length) throw new HttpError(400, `${key} must not contain duplicate labels.`)
+  return parsed
+}
+
+function addressValue(body: JsonObject, key: 'street' | 'city' | 'region' | 'postalCode' | 'countryName' | 'countryCode'): string | null {
+  const labels = { street: 'street', city: 'city', region: 'region', postalCode: 'postalCode', countryName: 'countryName', countryCode: 'countryCode' }
+  const value = optionalText(body, key, labels[key], key === 'street' ? 1_000 : 300)
+  if (key !== 'countryCode' || value === null) return value
+  const code = value.toUpperCase()
+  if (!/^[A-Z]{2}$/.test(code)) throw new HttpError(400, 'countryCode must be a two-letter ISO country code or null.')
+  return code
+}
+
+function addressFields(body: JsonObject): Array<{ key: 'street' | 'city' | 'region' | 'postalCode' | 'countryName' | 'countryCode'; column: string; value: string | null }> {
+  const fields = [
+    ['street', 'street'], ['city', 'city'], ['region', 'region'], ['postalCode', 'postal_code'],
+    ['countryName', 'country_name'], ['countryCode', 'country_code'],
+  ] as const
+  return fields.filter(([key]) => has(body, key)).map(([key, column]) => ({ key, column, value: addressValue(body, key) }))
+}
+
+function taxonomyValues(body: JsonObject, key: string, expectedTaxonomy: 'PERSON_CATEGORY' | 'COMPANY_CATEGORY' | 'INDUSTRY') {
+  const parsed = taxonomyLabels(body, key)
+  return { ...parsed, taxonomy: expectedTaxonomy }
+}
+
+type Taxonomy = 'PERSON_CATEGORY' | 'COMPANY_CATEGORY' | 'INDUSTRY'
+
+function taxonomyValue(value: unknown): Taxonomy {
+  if (value === 'PERSON_CATEGORY' || value === 'COMPANY_CATEGORY' || value === 'INDUSTRY') return value
+  throw new HttpError(400, 'taxonomy must be PERSON_CATEGORY, COMPANY_CATEGORY, or INDUSTRY.')
+}
+
+function taxonomyColor(value: unknown): string {
+  const color = text(value, 'color', { required: true, max: 7 }) as string
+  if (!/^#[0-9A-Fa-f]{6}$/.test(color)) throw new HttpError(400, 'color must be a six-digit hexadecimal color such as #6B8E7C.')
+  return color
+}
+
 function searchText(request: FastifyRequest): string | null {
   const query = queryObject(request)
   const raw = query.q ?? query.search
@@ -220,6 +336,14 @@ function limitValue(request: FastifyRequest, fallback = 50): number {
   if (raw === undefined) return fallback
   const value = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : NaN
   if (!Number.isInteger(value) || value < 1 || value > 100) throw new HttpError(400, 'limit must be an integer between 1 and 100.')
+  return value
+}
+
+function offsetValue(request: FastifyRequest): number {
+  const raw = queryObject(request).offset
+  if (raw === undefined) return 0
+  const value = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : NaN
+  if (!Number.isSafeInteger(value) || value < 0 || value > 1_000_000) throw new HttpError(400, 'offset must be an integer between 0 and 1000000.')
   return value
 }
 
@@ -264,9 +388,14 @@ async function assertIds(client: PoolClient, workspaceId: string, ids: string[],
 
 function associationIds(body: JsonObject, pluralKey: string, singularKey: string): { supplied: boolean; ids: string[] } {
   if (has(body, pluralKey)) {
-    if (!Array.isArray(body[pluralKey]) || body[pluralKey].length > 100) throw new HttpError(400, `${pluralKey} must be an array of at most 100 UUIDs.`)
-    const ids = (body[pluralKey] as unknown[]).map((item, index) => uuid(item, `${pluralKey}[${index}]`) as string)
-    return { supplied: true, ids: [...new Set(ids)] }
+    if (body[pluralKey] !== null && (!Array.isArray(body[pluralKey]) || body[pluralKey].length > 100)) throw new HttpError(400, `${pluralKey} must be an array of at most 100 UUIDs or null.`)
+    const ids = body[pluralKey] === null ? [] : (body[pluralKey] as unknown[]).map((item, index) => uuid(item, `${pluralKey}[${index}]`) as string)
+    const uniqueIds = [...new Set(ids)]
+    if (has(body, singularKey)) {
+      const singleId = uuid(body[singularKey], singularKey, true)
+      if (singleId !== (uniqueIds[0] ?? null)) throw new HttpError(400, `${singularKey} must match the primary entry in ${pluralKey}.`)
+    }
+    return { supplied: true, ids: uniqueIds }
   }
   if (has(body, singularKey)) {
     const id = uuid(body[singularKey], singularKey, true)
@@ -348,6 +477,22 @@ async function writeActivity(
     `INSERT INTO activity_records (workspace_id, activity_event_id, record_id)
      SELECT $1, $2, unnest($3::uuid[]) ON CONFLICT DO NOTHING`,
     [user.workspaceId, event.rows[0].id, ids],
+  )
+}
+
+async function writeTaxonomyActivity(
+  client: PoolClient,
+  user: AuthUser,
+  request: FastifyRequest,
+  action: 'TAXONOMY_TERM_CREATED' | 'TAXONOMY_TERM_UPDATED',
+  termId: string,
+  taxonomy: Taxonomy,
+  fields: string[],
+) {
+  await client.query(
+    `INSERT INTO activity_events (workspace_id, actor_id, owner_user_id, action, source, request_id, changed_fields)
+     VALUES ($1, $2, $3, $4, 'REST', $5, $6::jsonb)`,
+    [user.workspaceId, user.actorId, user.userId, action, requestId(request), JSON.stringify({ fields, taxonomy, taxonomyTermId: termId })],
   )
 }
 
@@ -471,6 +616,160 @@ async function setPrimaryAddressCity(
   }
 }
 
+async function setPrimaryAddress(
+  client: PoolClient,
+  table: 'person_addresses' | 'company_addresses',
+  ownerColumn: 'person_id' | 'company_id',
+  workspaceId: string,
+  ownerId: string,
+  fields: Array<{ column: string; value: string | null }>,
+) {
+  if (!fields.length) return
+  const current = await client.query(
+    `SELECT id FROM ${table} WHERE workspace_id = $1 AND ${ownerColumn} = $2 AND is_primary FOR UPDATE`,
+    [workspaceId, ownerId],
+  )
+  if (current.rowCount) {
+    const assignments = fields.map(({ column }, index) => `${column} = $${index + 3}`).join(', ')
+    await client.query(
+      `UPDATE ${table} SET ${assignments} WHERE workspace_id = $1 AND id = $2`,
+      [workspaceId, current.rows[0].id, ...fields.map(({ value }) => value)],
+    )
+    return
+  }
+  const valuesByColumn = new Map(fields.map(({ column, value }) => [column, value]))
+  if (![...valuesByColumn.values()].some((value) => value !== null)) return
+  const columns = [...valuesByColumn.keys()]
+  await client.query(
+    `INSERT INTO ${table} (workspace_id, ${ownerColumn}, ${columns.join(', ')}, is_primary)
+     VALUES ($1, $2, ${columns.map((_, index) => `$${index + 3}`).join(', ')}, true)`,
+    [workspaceId, ownerId, ...columns.map((column) => valuesByColumn.get(column))],
+  )
+}
+
+async function replacePersonEmails(client: PoolClient, workspaceId: string, personId: string, emails: Array<{ raw: string; normalized: string }>) {
+  for (const email of emails) await duplicateEmail(client, workspaceId, email.normalized, personId)
+  await client.query('DELETE FROM person_emails WHERE workspace_id = $1 AND person_id = $2', [workspaceId, personId])
+  for (const [index, email] of emails.entries()) {
+    await client.query(
+      `INSERT INTO person_emails (workspace_id, person_id, raw_email, normalized_email, is_primary, match_enabled)
+       VALUES ($1, $2, $3, $4, $5, true)`,
+      [workspaceId, personId, email.raw, email.normalized, index === 0],
+    )
+  }
+}
+
+async function replacePersonPhones(client: PoolClient, workspaceId: string, personId: string, phones: Array<{ raw: string; e164: string | null }>) {
+  for (const phone of phones) {
+    if (!phone.e164) continue
+    const duplicate = await client.query(
+      'SELECT person_id AS id FROM person_phones WHERE workspace_id = $1 AND e164 = $2 AND person_id <> $3 LIMIT 1',
+      [workspaceId, phone.e164, personId],
+    )
+    if (duplicate.rowCount) throw new HttpError(409, 'A person with this phone number already exists.', 'Duplicate phone', { duplicateRecordId: duplicate.rows[0].id })
+  }
+  await client.query('DELETE FROM person_phones WHERE workspace_id = $1 AND person_id = $2', [workspaceId, personId])
+  for (const [index, phone] of phones.entries()) {
+    await client.query(
+      `INSERT INTO person_phones (workspace_id, person_id, raw_phone, e164, is_primary)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [workspaceId, personId, phone.raw, phone.e164, index === 0],
+    )
+  }
+}
+
+async function replacePersonCompanies(client: PoolClient, workspaceId: string, personId: string, companyIds: string[]) {
+  await assertIds(client, workspaceId, companyIds, 'companies')
+  await client.query(
+    `UPDATE person_companies SET is_primary = false, ended_on = COALESCE(ended_on, CURRENT_DATE)
+      WHERE workspace_id = $1 AND person_id = $2 AND ended_on IS NULL`,
+    [workspaceId, personId],
+  )
+  for (const [index, companyId] of companyIds.entries()) {
+    await client.query(
+      `INSERT INTO person_companies (workspace_id, person_id, company_id, is_primary)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (workspace_id, person_id, company_id) DO UPDATE SET
+         is_primary = EXCLUDED.is_primary, ended_on = NULL`,
+      [workspaceId, personId, companyId, index === 0],
+    )
+  }
+}
+
+async function replacePersonLinkKind(
+  client: PoolClient,
+  workspaceId: string,
+  personId: string,
+  kind: 'linkedin' | 'other',
+  links: Array<{ raw: string; canonical: string }>,
+) {
+  if (kind === 'linkedin') {
+    await client.query("DELETE FROM person_links WHERE workspace_id = $1 AND person_id = $2 AND lower(kind) = 'linkedin'", [workspaceId, personId])
+    await client.query('UPDATE person_links SET is_primary = false WHERE workspace_id = $1 AND person_id = $2', [workspaceId, personId])
+  } else {
+    await client.query("DELETE FROM person_links WHERE workspace_id = $1 AND person_id = $2 AND lower(kind) <> 'linkedin'", [workspaceId, personId])
+  }
+  for (const [index, link] of links.entries()) {
+    await client.query(
+      `INSERT INTO person_links (workspace_id, person_id, kind, raw_url, canonical_url, is_primary)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [workspaceId, personId, kind, link.raw, link.canonical, kind === 'linkedin' && index === 0],
+    )
+  }
+}
+
+async function replaceCompanyLinks(client: PoolClient, workspaceId: string, companyId: string, links: Array<{ raw: string; canonical: string }>) {
+  await client.query("DELETE FROM company_links WHERE workspace_id = $1 AND company_id = $2 AND lower(kind) <> 'website'", [workspaceId, companyId])
+  for (const link of links) {
+    await client.query(
+      `INSERT INTO company_links (workspace_id, company_id, kind, raw_url, canonical_url, is_primary)
+       VALUES ($1, $2, 'OTHER', $3, $4, false)`,
+      [workspaceId, companyId, link.raw, link.canonical],
+    )
+  }
+}
+
+async function replaceCompanyDomains(client: PoolClient, workspaceId: string, companyId: string, domains: Array<{ raw: string; normalized: string }>) {
+  for (const domain of domains) await duplicateDomain(client, workspaceId, domain.normalized, companyId)
+  await client.query('DELETE FROM company_domains WHERE workspace_id = $1 AND company_id = $2', [workspaceId, companyId])
+  for (const [index, domain] of domains.entries()) {
+    await client.query(
+      `INSERT INTO company_domains (workspace_id, company_id, raw_domain, normalized_domain, is_primary)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [workspaceId, companyId, domain.raw, domain.normalized, index === 0],
+    )
+  }
+}
+
+async function replaceTaxonomyTerms(
+  client: PoolClient,
+  workspaceId: string,
+  recordId: string,
+  taxonomy: 'PERSON_CATEGORY' | 'COMPANY_CATEGORY' | 'INDUSTRY',
+  labels: string[],
+) {
+  await client.query(
+    `DELETE FROM record_taxonomies rt USING taxonomy_terms t
+      WHERE rt.workspace_id = $1 AND rt.record_id = $2 AND t.workspace_id = rt.workspace_id
+        AND t.id = rt.taxonomy_term_id AND t.taxonomy = $3`,
+    [workspaceId, recordId, taxonomy],
+  )
+  for (const label of labels) {
+    const normalized = label.toLowerCase()
+    const term = await client.query(
+      `INSERT INTO taxonomy_terms (workspace_id, taxonomy, label, normalized_label)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (workspace_id, taxonomy, normalized_label) DO UPDATE SET normalized_label = EXCLUDED.normalized_label
+       RETURNING id`,
+      [workspaceId, taxonomy, label, normalized],
+    )
+    await client.query(
+      'INSERT INTO record_taxonomies (workspace_id, record_id, taxonomy_term_id) VALUES ($1, $2, $3)',
+      [workspaceId, recordId, term.rows[0].id],
+    )
+  }
+}
+
 async function setPersonCompany(client: PoolClient, workspaceId: string, personId: string, companyId: string | null) {
   if (companyId) await assertIds(client, workspaceId, [companyId], 'companies')
   await client.query(
@@ -491,20 +790,29 @@ const PERSON_SELECT = `
   SELECT p.id, p.full_name AS "fullName", p.job_title AS "jobTitle", p.description, p.importance,
          r.version, r.created_at AS "createdAt", r.updated_at AS "updatedAt",
          (SELECT e.raw_email FROM person_emails e WHERE e.workspace_id = p.workspace_id AND e.person_id = p.id AND e.is_primary ORDER BY e.created_at LIMIT 1) AS email,
-         COALESCE((SELECT jsonb_agg(jsonb_build_object('email', e.raw_email, 'isPrimary', e.is_primary) ORDER BY e.is_primary DESC, e.created_at)
+          COALESCE((SELECT jsonb_agg(e.raw_email ORDER BY e.is_primary DESC, e.created_at)
                    FROM person_emails e WHERE e.workspace_id = p.workspace_id AND e.person_id = p.id), '[]'::jsonb) AS emails,
          (SELECT ph.raw_phone FROM person_phones ph WHERE ph.workspace_id = p.workspace_id AND ph.person_id = p.id AND ph.is_primary ORDER BY ph.created_at LIMIT 1) AS phone,
-         COALESCE((SELECT jsonb_agg(jsonb_build_object('phone', ph.raw_phone, 'isPrimary', ph.is_primary) ORDER BY ph.is_primary DESC, ph.created_at)
+          COALESCE((SELECT jsonb_agg(ph.raw_phone ORDER BY ph.is_primary DESC, ph.created_at)
                    FROM person_phones ph WHERE ph.workspace_id = p.workspace_id AND ph.person_id = p.id), '[]'::jsonb) AS phones,
-         (SELECT c.id FROM person_companies pc JOIN companies c ON c.workspace_id = pc.workspace_id AND c.id = pc.company_id
-           WHERE pc.workspace_id = p.workspace_id AND pc.person_id = p.id AND pc.is_primary AND pc.ended_on IS NULL LIMIT 1) AS "companyId",
-          (SELECT c.name FROM person_companies pc JOIN companies c ON c.workspace_id = pc.workspace_id AND c.id = pc.company_id
-            WHERE pc.workspace_id = p.workspace_id AND pc.person_id = p.id AND pc.is_primary AND pc.ended_on IS NULL LIMIT 1) AS "companyName"
-          ,(SELECT a.city FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS city
-          ,(SELECT a.region FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS region
-          ,(SELECT a.country_name FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS "countryName"
+          (SELECT c.id FROM person_companies pc JOIN companies c ON c.workspace_id = pc.workspace_id AND c.id = pc.company_id
+            WHERE pc.workspace_id = p.workspace_id AND pc.person_id = p.id AND pc.is_primary AND pc.ended_on IS NULL LIMIT 1) AS "companyId",
+           (SELECT c.name FROM person_companies pc JOIN companies c ON c.workspace_id = pc.workspace_id AND c.id = pc.company_id
+             WHERE pc.workspace_id = p.workspace_id AND pc.person_id = p.id AND pc.is_primary AND pc.ended_on IS NULL LIMIT 1) AS "companyName"
+           ,COALESCE((SELECT jsonb_agg(c.id ORDER BY pc.is_primary DESC, c.name)
+                        FROM person_companies pc JOIN companies c ON c.workspace_id = pc.workspace_id AND c.id = pc.company_id
+                       WHERE pc.workspace_id = p.workspace_id AND pc.person_id = p.id AND pc.ended_on IS NULL), '[]'::jsonb) AS "companyIds"
+           ,p.introduced_by_person_id AS "introducedByPersonId"
+           ,(SELECT l.raw_url FROM person_links l WHERE l.workspace_id = p.workspace_id AND l.person_id = p.id AND lower(l.kind) = 'linkedin' ORDER BY l.is_primary DESC LIMIT 1) AS "linkedinUrl"
+            ,COALESCE((SELECT jsonb_agg(l.raw_url ORDER BY l.is_primary DESC, l.kind, l.raw_url)
+                        FROM person_links l WHERE l.workspace_id = p.workspace_id AND l.person_id = p.id AND lower(l.kind) <> 'linkedin'), '[]'::jsonb) AS links
+           ,(SELECT a.street FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS street
+           ,(SELECT a.city FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS city
+           ,(SELECT a.region FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS region
+           ,(SELECT a.postal_code FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS "postalCode"
+           ,(SELECT a.country_name FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS "countryName"
           ,(SELECT a.country_code FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS "countryCode"
-          ,COALESCE((SELECT jsonb_agg(t.label ORDER BY t.normalized_label)
+           ,COALESCE((SELECT jsonb_agg(jsonb_build_object('label', t.label, 'color', t.color) ORDER BY t.sort_order, t.normalized_label)
                        FROM record_taxonomies rt JOIN taxonomy_terms t ON t.workspace_id = rt.workspace_id AND t.id = rt.taxonomy_term_id
                       WHERE rt.workspace_id = p.workspace_id AND rt.record_id = p.id AND t.taxonomy = 'PERSON_CATEGORY'), '[]'::jsonb) AS categories
           ,COALESCE((SELECT jsonb_agg(jsonb_build_object(
@@ -523,21 +831,27 @@ const PERSON_SELECT = `
 const COMPANY_SELECT = `
   SELECT c.id, c.name, c.description, c.owner_user_id AS "ownerUserId", c.customer_profile AS "customerProfile",
          c.business_role AS "businessRole", r.version, r.created_at AS "createdAt", r.updated_at AS "updatedAt",
-         (SELECT d.raw_domain FROM company_domains d WHERE d.workspace_id = c.workspace_id AND d.company_id = c.id AND d.is_primary LIMIT 1) AS domain,
-         (SELECT l.raw_url FROM company_links l WHERE l.workspace_id = c.workspace_id AND l.company_id = c.id AND l.is_primary LIMIT 1) AS website,
+          (SELECT d.raw_domain FROM company_domains d WHERE d.workspace_id = c.workspace_id AND d.company_id = c.id AND d.is_primary LIMIT 1) AS domain,
+          COALESCE((SELECT jsonb_agg(d.raw_domain ORDER BY d.is_primary DESC, d.normalized_domain)
+                    FROM company_domains d WHERE d.workspace_id = c.workspace_id AND d.company_id = c.id), '[]'::jsonb) AS domains,
+          (SELECT l.raw_url FROM company_links l WHERE l.workspace_id = c.workspace_id AND l.company_id = c.id AND lower(l.kind) = 'website' ORDER BY l.is_primary DESC LIMIT 1) AS website,
+           COALESCE((SELECT jsonb_agg(l.raw_url ORDER BY l.is_primary DESC, l.kind, l.raw_url)
+                    FROM company_links l WHERE l.workspace_id = c.workspace_id AND l.company_id = c.id AND lower(l.kind) <> 'website'), '[]'::jsonb) AS links,
           COALESCE((SELECT jsonb_agg(jsonb_build_object('id', p.id, 'fullName', p.full_name, 'jobTitle', pc.job_title)
                     ORDER BY pc.is_primary DESC, p.full_name)
                    FROM person_companies pc JOIN people p ON p.workspace_id = pc.workspace_id AND p.id = pc.person_id
                    WHERE pc.workspace_id = c.workspace_id AND pc.company_id = c.id AND pc.ended_on IS NULL), '[]'::jsonb) AS people,
           (SELECT count(*)::integer FROM person_companies pc WHERE pc.workspace_id = c.workspace_id AND pc.company_id = c.id AND pc.ended_on IS NULL) AS "peopleCount",
-          (SELECT a.city FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS city,
-          (SELECT a.region FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS region,
+           (SELECT a.city FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS city,
+           (SELECT a.street FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS street,
+           (SELECT a.region FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS region,
+           (SELECT a.postal_code FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS "postalCode",
           (SELECT a.country_name FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS "countryName",
           (SELECT a.country_code FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS "countryCode",
-          COALESCE((SELECT jsonb_agg(t.label ORDER BY t.normalized_label)
+           COALESCE((SELECT jsonb_agg(jsonb_build_object('label', t.label, 'color', t.color) ORDER BY t.sort_order, t.normalized_label)
                       FROM record_taxonomies rt JOIN taxonomy_terms t ON t.workspace_id = rt.workspace_id AND t.id = rt.taxonomy_term_id
                      WHERE rt.workspace_id = c.workspace_id AND rt.record_id = c.id AND t.taxonomy = 'COMPANY_CATEGORY'), '[]'::jsonb) AS categories,
-          COALESCE((SELECT jsonb_agg(t.label ORDER BY t.normalized_label)
+           COALESCE((SELECT jsonb_agg(jsonb_build_object('label', t.label, 'color', t.color) ORDER BY t.sort_order, t.normalized_label)
                       FROM record_taxonomies rt JOIN taxonomy_terms t ON t.workspace_id = rt.workspace_id AND t.id = rt.taxonomy_term_id
                      WHERE rt.workspace_id = c.workspace_id AND rt.record_id = c.id AND t.taxonomy = 'INDUSTRY'), '[]'::jsonb) AS industries
     FROM companies c JOIN records r USING (id, workspace_id)
@@ -592,38 +906,157 @@ async function replaceJunction(
 }
 
 export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): void {
+  app.get('/api/v1/users', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
+    const q = escapedLike(searchText(request))
+    const limit = limitValue(request)
+    const result = await pool.query(
+      `SELECT id, full_name AS "fullName", email, role
+         FROM users
+        WHERE workspace_id = $1 AND state = 'ACTIVE'
+          AND ($2::text IS NULL OR full_name ILIKE $2 ESCAPE '\\' OR email ILIKE $2 ESCAPE '\\')
+        ORDER BY full_name, id LIMIT $3`,
+      [user.workspaceId, q, limit],
+    )
+    return reply.send({ items: result.rows })
+  }))
+
+  app.get('/api/v1/taxonomies', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
+    const query = queryObject(request)
+    const taxonomy = taxonomyValue(query.taxonomy)
+    const q = escapedLike(searchText(request))
+    const limit = limitValue(request)
+    const result = await pool.query(
+      `SELECT id, label, taxonomy, color, description
+         FROM taxonomy_terms
+        WHERE workspace_id = $1 AND taxonomy = $2 AND is_active
+          AND ($3::text IS NULL OR label ILIKE $3 ESCAPE '\\')
+        ORDER BY normalized_label, id LIMIT $4`,
+      [user.workspaceId, taxonomy, q, limit],
+    )
+    return reply.send({ items: result.rows })
+  }))
+
+  app.get('/api/v1/admin/taxonomies', { preHandler: requireAuth }, protectedAdminHandler(async (request, reply, user) => {
+    const query = queryObject(request)
+    const taxonomy = taxonomyValue(query.taxonomy)
+    const q = escapedLike(searchText(request))
+    const limit = limitValue(request)
+    const result = await pool.query(
+      `SELECT id, taxonomy, label, color, description, is_active AS "isActive", sort_order AS "sortOrder",
+              created_at AS "createdAt"
+         FROM taxonomy_terms
+        WHERE workspace_id = $1 AND taxonomy = $2
+          AND ($3::text IS NULL OR label ILIKE $3 ESCAPE '\\')
+        ORDER BY sort_order, normalized_label, id LIMIT $4`,
+      [user.workspaceId, taxonomy, q, limit],
+    )
+    return reply.send({ items: result.rows })
+  }))
+
+  app.post('/api/v1/admin/taxonomies', { preHandler: requireAuth }, protectedAdminHandler(async (request, reply, user) => {
+    const body = objectBody(request)
+    rejectUnknown(body, ['taxonomy', 'label', 'color', 'description'])
+    const taxonomy = taxonomyValue(body.taxonomy)
+    const label = requiredText(body, 'label', 'label', 200)
+    const color = taxonomyColor(body.color)
+    const description = has(body, 'description') ? optionalText(body, 'description', 'description', 10_000) : null
+    const result = await transaction(pool, async (client) => {
+      const created = await client.query(
+        `INSERT INTO taxonomy_terms (workspace_id, taxonomy, label, normalized_label, color, description)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, taxonomy, label, color, description, is_active AS "isActive", sort_order AS "sortOrder",
+                   created_at AS "createdAt"`,
+        [user.workspaceId, taxonomy, label, label.toLowerCase(), color, description],
+      )
+      await writeTaxonomyActivity(client, user, request, 'TAXONOMY_TERM_CREATED', created.rows[0].id, taxonomy, [
+        'taxonomy', 'label', 'color', ...(has(body, 'description') ? ['description'] : []),
+      ])
+      return created.rows[0]
+    })
+    return reply.code(201).send(result)
+  }))
+
+  app.patch('/api/v1/admin/taxonomies/:id', { preHandler: requireAuth }, protectedAdminHandler(async (request, reply, user) => {
+    const id = recordId(request)
+    const body = objectBody(request)
+    rejectUnknown(body, ['label', 'color', 'description', 'isActive', 'sortOrder'])
+    const updates: Array<{ column: string; value: unknown; field: string }> = []
+    if (has(body, 'label')) {
+      const label = requiredText(body, 'label', 'label', 200)
+      updates.push({ column: 'label', value: label, field: 'label' }, { column: 'normalized_label', value: label.toLowerCase(), field: 'label' })
+    }
+    if (has(body, 'color')) updates.push({ column: 'color', value: taxonomyColor(body.color), field: 'color' })
+    if (has(body, 'description')) updates.push({ column: 'description', value: optionalText(body, 'description', 'description', 10_000), field: 'description' })
+    if (has(body, 'isActive')) {
+      if (typeof body.isActive !== 'boolean') throw new HttpError(400, 'isActive must be a boolean.')
+      updates.push({ column: 'is_active', value: body.isActive, field: 'isActive' })
+    }
+    if (has(body, 'sortOrder')) {
+      updates.push({
+        column: 'sort_order',
+        value: numberValue(body.sortOrder, 'sortOrder', { min: -2_147_483_648, max: 2_147_483_647, integer: true }),
+        field: 'sortOrder',
+      })
+    }
+    const fields = [...new Set(updates.map(({ field }) => field))]
+    if (!fields.length) throw new HttpError(400, 'At least one taxonomy field to update is required.')
+
+    const result = await transaction(pool, async (client) => {
+      const current = await client.query(
+        'SELECT id FROM taxonomy_terms WHERE workspace_id = $1 AND id = $2 FOR UPDATE',
+        [user.workspaceId, id],
+      )
+      if (!current.rowCount) throw new HttpError(404, 'Taxonomy term not found.')
+      const assignments = updates.map(({ column }, index) => `${column} = $${index + 3}`).join(', ')
+      const updated = await client.query(
+        `UPDATE taxonomy_terms SET ${assignments}
+          WHERE workspace_id = $1 AND id = $2
+          RETURNING id, taxonomy, label, color, description, is_active AS "isActive", sort_order AS "sortOrder",
+                    created_at AS "createdAt"`,
+        [user.workspaceId, id, ...updates.map(({ value }) => value)],
+      )
+      await writeTaxonomyActivity(client, user, request, 'TAXONOMY_TERM_UPDATED', updated.rows[0].id, updated.rows[0].taxonomy, fields)
+      return updated.rows[0]
+    })
+    return reply.send(result)
+  }))
+
   app.get('/api/v1/people', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const q = escapedLike(searchText(request))
     const limit = limitValue(request)
+    const offset = offsetValue(request)
     const result = await pool.query(
       `${PERSON_SELECT}
        AND ($2::text IS NULL OR p.full_name ILIKE $2 ESCAPE '\\' OR p.job_title ILIKE $2 ESCAPE '\\'
             OR EXISTS (SELECT 1 FROM person_emails e WHERE e.workspace_id = p.workspace_id AND e.person_id = p.id AND e.raw_email ILIKE $2 ESCAPE '\\')
             OR EXISTS (SELECT 1 FROM person_companies pc JOIN companies c ON c.workspace_id = pc.workspace_id AND c.id = pc.company_id WHERE pc.workspace_id = p.workspace_id AND pc.person_id = p.id AND c.name ILIKE $2 ESCAPE '\\'))
-       ORDER BY r.updated_at DESC, p.id LIMIT $3`,
-      [user.workspaceId, q, limit],
+        ORDER BY r.updated_at DESC, p.id LIMIT $3 OFFSET $4`,
+      [user.workspaceId, q, limit, offset],
     )
     return reply.send({ items: result.rows })
   }))
 
   app.post('/api/v1/people', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const body = objectBody(request)
-    rejectUnknown(body, ['fullName', 'firstName', 'lastName', 'jobTitle', 'description', 'importance', 'email', 'phone', 'city', 'companyId', 'introducedByPersonId'])
+    rejectUnknown(body, ['fullName', 'firstName', 'lastName', 'jobTitle', 'description', 'importance', 'email', 'emails', 'phone', 'phones', 'companyId', 'companyIds', 'introducedByPersonId', 'linkedinUrl', 'links', 'categories', 'street', 'city', 'region', 'postalCode', 'countryName', 'countryCode'])
     let fullName: string
     if (has(body, 'fullName')) fullName = requiredText(body, 'fullName', 'fullName', 500)
     else fullName = [requiredText(body, 'firstName', 'firstName', 250), requiredText(body, 'lastName', 'lastName', 250)].join(' ').trim()
     const jobTitle = has(body, 'jobTitle') ? optionalText(body, 'jobTitle', 'jobTitle', 500) : null
     const description = has(body, 'description') ? optionalText(body, 'description', 'description', 20_000) : null
     const importance = has(body, 'importance') ? numberValue(body.importance, 'importance', { min: 0, max: 5, integer: true, nullable: true }) : null
-    const email = has(body, 'email') ? emailAddress(body.email) : null
-    const phone = has(body, 'phone') ? normalizedPhone(body.phone) : null
-    const city = has(body, 'city') ? optionalText(body, 'city', 'city', 300) : null
-    const companyId = has(body, 'companyId') ? uuid(body.companyId, 'companyId', true) : null
+    const emails = emailArray(body).values
+    const phones = phoneArray(body).values
+    const companies = associationIds(body, 'companyIds', 'companyId')
     const introducedBy = has(body, 'introducedByPersonId') ? uuid(body.introducedByPersonId, 'introducedByPersonId', true) : null
+    const linkedinUrl = has(body, 'linkedinUrl') ? canonicalWebsite(body.linkedinUrl) : null
+    const links = urlArray(body, 'links').values
+    const categories = taxonomyValues(body, 'categories', 'PERSON_CATEGORY').values
+    const address = addressFields(body)
 
     const result = await transaction(pool, async (client) => {
-      if (email) await duplicateEmail(client, user.workspaceId, email.normalized)
-      if (companyId) await assertIds(client, user.workspaceId, [companyId], 'companies')
+      for (const email of emails) await duplicateEmail(client, user.workspaceId, email.normalized)
+      await assertIds(client, user.workspaceId, companies.ids, 'companies')
       if (introducedBy) await assertIds(client, user.workspaceId, [introducedBy], 'people')
       const record = await insertRecord(client, user.workspaceId, user.actorId, 'PERSON')
       await client.query(
@@ -631,23 +1064,22 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
         [record.id, user.workspaceId, fullName, fullName.toLowerCase(), jobTitle, description, importance, introducedBy],
       )
-      if (email) await client.query(
-        `INSERT INTO person_emails (workspace_id, person_id, raw_email, normalized_email, is_primary, match_enabled)
-         VALUES ($1, $2, $3, $4, true, true)`, [user.workspaceId, record.id, email.raw, email.normalized],
-      )
-      if (phone) await client.query(
-        `INSERT INTO person_phones (workspace_id, person_id, raw_phone, e164, is_primary)
-         VALUES ($1, $2, $3, $4, true)`, [user.workspaceId, record.id, phone.raw, phone.e164],
-      )
-      if (city) await client.query(
-        `INSERT INTO person_addresses (workspace_id, person_id, city, is_primary) VALUES ($1, $2, $3, true)`,
-        [user.workspaceId, record.id, city],
-      )
-      if (companyId) await client.query(
-        `INSERT INTO person_companies (workspace_id, person_id, company_id, is_primary) VALUES ($1, $2, $3, true)`,
-        [user.workspaceId, record.id, companyId],
-      )
-      await writeActivity(client, user, request, 'PERSON_CREATED', record.id, ['fullName', ...(email ? ['email'] : []), ...(phone ? ['phone'] : []), ...(city ? ['city'] : []), ...(companyId ? ['companyId'] : [])], [companyId, introducedBy].filter((id): id is string => !!id))
+      if (emails.length) await replacePersonEmails(client, user.workspaceId, record.id, emails)
+      if (phones.length) await replacePersonPhones(client, user.workspaceId, record.id, phones)
+      if (address.length) await setPrimaryAddress(client, 'person_addresses', 'person_id', user.workspaceId, record.id, address.map(({ column, value }) => ({ column, value })))
+      if (companies.supplied) await replacePersonCompanies(client, user.workspaceId, record.id, companies.ids)
+      if (linkedinUrl) await replacePersonLinkKind(client, user.workspaceId, record.id, 'linkedin', [linkedinUrl])
+      if (has(body, 'links')) await replacePersonLinkKind(client, user.workspaceId, record.id, 'other', links)
+      if (has(body, 'categories')) await replaceTaxonomyTerms(client, user.workspaceId, record.id, 'PERSON_CATEGORY', categories)
+      const changed = [
+        'fullName', ...(has(body, 'jobTitle') ? ['jobTitle'] : []), ...(has(body, 'description') ? ['description'] : []),
+        ...(has(body, 'importance') ? ['importance'] : []), ...(has(body, 'email') || has(body, 'emails') ? ['emails'] : []),
+        ...(has(body, 'phone') || has(body, 'phones') ? ['phones'] : []),
+        ...address.map(({ key }) => key), ...(companies.supplied ? ['companyIds'] : []),
+        ...(has(body, 'introducedByPersonId') ? ['introducedByPersonId'] : []), ...(has(body, 'linkedinUrl') ? ['linkedinUrl'] : []),
+        ...(has(body, 'links') ? ['links'] : []), ...(has(body, 'categories') ? ['categories'] : []),
+      ]
+      await writeActivity(client, user, request, 'PERSON_CREATED', record.id, changed, [...companies.ids, introducedBy].filter((id): id is string => !!id))
       const created = await client.query(`${PERSON_SELECT} AND p.id = $2`, [user.workspaceId, record.id])
       return { data: created.rows[0], version: record.version }
     })
@@ -666,7 +1098,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
   app.patch('/api/v1/people/:id', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const id = recordId(request)
     const body = objectBody(request)
-    rejectUnknown(body, ['version', 'fullName', 'jobTitle', 'description', 'importance', 'email', 'phone', 'city', 'companyId', 'introducedByPersonId'])
+    rejectUnknown(body, ['version', 'fullName', 'jobTitle', 'description', 'importance', 'email', 'emails', 'phone', 'phones', 'companyId', 'companyIds', 'introducedByPersonId', 'linkedinUrl', 'links', 'categories', 'street', 'city', 'region', 'postalCode', 'countryName', 'countryCode'])
     const expected = expectedVersion(request, body)
     const columns: Array<{ column: string; value: unknown }> = []
     const changed: string[] = []
@@ -674,15 +1106,21 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
     if (has(body, 'jobTitle')) { columns.push({ column: 'job_title', value: optionalText(body, 'jobTitle', 'jobTitle', 500) }); changed.push('jobTitle') }
     if (has(body, 'description')) { columns.push({ column: 'description', value: optionalText(body, 'description', 'description', 20_000) }); changed.push('description') }
     if (has(body, 'importance')) { columns.push({ column: 'importance', value: numberValue(body.importance, 'importance', { min: 0, max: 5, integer: true, nullable: true }) }); changed.push('importance') }
-    const email = has(body, 'email') ? emailAddress(body.email) : undefined
-    const phone = has(body, 'phone') ? normalizedPhone(body.phone) : undefined
-    const city = has(body, 'city') ? optionalText(body, 'city', 'city', 300) : undefined
-    const companyId = has(body, 'companyId') ? uuid(body.companyId, 'companyId', true) : undefined
+    const emails = emailArray(body)
+    const phones = phoneArray(body)
+    const companies = associationIds(body, 'companyIds', 'companyId')
     const introducedBy = has(body, 'introducedByPersonId') ? uuid(body.introducedByPersonId, 'introducedByPersonId', true) : undefined
-    if (email !== undefined) changed.push('email')
-    if (phone !== undefined) changed.push('phone')
-    if (city !== undefined) changed.push('city')
-    if (companyId !== undefined) changed.push('companyId')
+    const linkedinUrl = has(body, 'linkedinUrl') ? canonicalWebsite(body.linkedinUrl) : undefined
+    const links = urlArray(body, 'links')
+    const categories = taxonomyValues(body, 'categories', 'PERSON_CATEGORY')
+    const address = addressFields(body)
+    if (emails.supplied) changed.push(has(body, 'emails') ? 'emails' : 'email')
+    if (phones.supplied) changed.push(has(body, 'phones') ? 'phones' : 'phone')
+    if (companies.supplied) changed.push(has(body, 'companyIds') ? 'companyIds' : 'companyId')
+    if (linkedinUrl !== undefined) changed.push('linkedinUrl')
+    if (links.supplied) changed.push('links')
+    if (categories.supplied) changed.push('categories')
+    changed.push(...address.map(({ key }) => key))
     if (introducedBy !== undefined) { columns.push({ column: 'introduced_by_person_id', value: introducedBy }); changed.push('introducedByPersonId') }
     if (!changed.length) throw new HttpError(400, 'At least one field to update is required.')
 
@@ -690,14 +1128,23 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
       const current = await client.query('SELECT id FROM people WHERE workspace_id = $1 AND id = $2', [user.workspaceId, id])
       if (!current.rowCount) throw new HttpError(404, 'Person not found.')
       if (introducedBy) await assertIds(client, user.workspaceId, [introducedBy], 'people')
-      if (companyId) await assertIds(client, user.workspaceId, [companyId], 'companies')
+      if (companies.supplied) await assertIds(client, user.workspaceId, companies.ids, 'companies')
       const version = await bumpRecordVersion(client, user.workspaceId, id, user.actorId, expected)
       await updateSubtype(client, 'people', user.workspaceId, id, columns)
-      if (email !== undefined) await setPersonEmail(client, user.workspaceId, id, email)
-      if (phone !== undefined) await setPersonPhone(client, user.workspaceId, id, phone)
-      if (city !== undefined) await setPrimaryAddressCity(client, 'person_addresses', 'person_id', user.workspaceId, id, city)
-      if (companyId !== undefined) await setPersonCompany(client, user.workspaceId, id, companyId)
-      await writeActivity(client, user, request, 'PERSON_UPDATED', id, changed, [companyId].filter((value): value is string => !!value))
+      if (emails.supplied) {
+        if (has(body, 'emails')) await replacePersonEmails(client, user.workspaceId, id, emails.values)
+        else await setPersonEmail(client, user.workspaceId, id, emails.values[0] ?? null)
+      }
+      if (phones.supplied) {
+        if (has(body, 'phones')) await replacePersonPhones(client, user.workspaceId, id, phones.values)
+        else await setPersonPhone(client, user.workspaceId, id, phones.values[0] ?? null)
+      }
+      if (address.length) await setPrimaryAddress(client, 'person_addresses', 'person_id', user.workspaceId, id, address.map(({ column, value }) => ({ column, value })))
+      if (companies.supplied) await replacePersonCompanies(client, user.workspaceId, id, companies.ids)
+      if (linkedinUrl !== undefined) await replacePersonLinkKind(client, user.workspaceId, id, 'linkedin', linkedinUrl ? [linkedinUrl] : [])
+      if (links.supplied) await replacePersonLinkKind(client, user.workspaceId, id, 'other', links.values)
+      if (categories.supplied) await replaceTaxonomyTerms(client, user.workspaceId, id, 'PERSON_CATEGORY', categories.values)
+      await writeActivity(client, user, request, 'PERSON_UPDATED', id, changed, [...(companies.supplied ? companies.ids : []), ...(introducedBy ? [introducedBy] : [])])
       const updated = await client.query(`${PERSON_SELECT} AND p.id = $2`, [user.workspaceId, id])
       return { data: updated.rows[0], version }
     })
@@ -708,49 +1155,54 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
   app.get('/api/v1/companies', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const q = escapedLike(searchText(request))
     const limit = limitValue(request)
+    const offset = offsetValue(request)
     const result = await pool.query(
       `${COMPANY_SELECT}
        AND ($2::text IS NULL OR c.name ILIKE $2 ESCAPE '\\' OR c.description ILIKE $2 ESCAPE '\\'
             OR EXISTS (SELECT 1 FROM company_domains d WHERE d.workspace_id = c.workspace_id AND d.company_id = c.id AND d.raw_domain ILIKE $2 ESCAPE '\\'))
-       ORDER BY r.updated_at DESC, c.id LIMIT $3`,
-      [user.workspaceId, q, limit],
+        ORDER BY r.updated_at DESC, c.id LIMIT $3 OFFSET $4`,
+      [user.workspaceId, q, limit, offset],
     )
     return reply.send({ items: result.rows })
   }))
 
   app.post('/api/v1/companies', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const body = objectBody(request)
-    rejectUnknown(body, ['name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'website', 'city'])
+    rejectUnknown(body, ['name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'domains', 'website', 'links', 'categories', 'industries', 'street', 'city', 'region', 'postalCode', 'countryName', 'countryCode'])
     const name = requiredText(body, 'name', 'name', 500)
     const description = has(body, 'description') ? optionalText(body, 'description', 'description', 20_000) : null
     const ownerUserId = has(body, 'ownerUserId') ? uuid(body.ownerUserId, 'ownerUserId', true) : null
     const customerProfile = has(body, 'customerProfile') ? optionalText(body, 'customerProfile', 'customerProfile', 10_000) : null
     const businessRole = has(body, 'businessRole') ? optionalText(body, 'businessRole', 'businessRole', 500) : null
-    const domain = has(body, 'domain') ? normalizedDomain(body.domain) : null
+    const domains = domainArray(body)
     const website = has(body, 'website') ? canonicalWebsite(body.website) : null
-    const city = has(body, 'city') ? optionalText(body, 'city', 'city', 300) : null
+    const links = urlArray(body, 'links')
+    const categories = taxonomyValues(body, 'categories', 'COMPANY_CATEGORY')
+    const industries = taxonomyValues(body, 'industries', 'INDUSTRY')
+    const address = addressFields(body)
     const result = await transaction(pool, async (client) => {
       await assertUser(client, user.workspaceId, ownerUserId)
-      if (domain) await duplicateDomain(client, user.workspaceId, domain.normalized)
       const record = await insertRecord(client, user.workspaceId, user.actorId, 'COMPANY')
       await client.query(
         `INSERT INTO companies (id, workspace_id, name, normalized_name, description, owner_user_id, customer_profile, business_role)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
         [record.id, user.workspaceId, name, name.toLowerCase(), description, ownerUserId, customerProfile, businessRole],
       )
-      if (domain) await client.query(
-        `INSERT INTO company_domains (workspace_id, company_id, raw_domain, normalized_domain, is_primary) VALUES ($1, $2, $3, $4, true)`,
-        [user.workspaceId, record.id, domain.raw, domain.normalized],
-      )
+      if (domains.supplied) await replaceCompanyDomains(client, user.workspaceId, record.id, domains.values)
       if (website) await client.query(
         `INSERT INTO company_links (workspace_id, company_id, kind, raw_url, canonical_url, is_primary) VALUES ($1, $2, 'WEBSITE', $3, $4, true)`,
         [user.workspaceId, record.id, website.raw, website.canonical],
       )
-      if (city) await client.query(
-        `INSERT INTO company_addresses (workspace_id, company_id, city, is_primary) VALUES ($1, $2, $3, true)`,
-        [user.workspaceId, record.id, city],
-      )
-      await writeActivity(client, user, request, 'COMPANY_CREATED', record.id, ['name', ...(domain ? ['domain'] : []), ...(website ? ['website'] : [])])
+      if (links.supplied) await replaceCompanyLinks(client, user.workspaceId, record.id, links.values)
+      if (categories.supplied) await replaceTaxonomyTerms(client, user.workspaceId, record.id, 'COMPANY_CATEGORY', categories.values)
+      if (industries.supplied) await replaceTaxonomyTerms(client, user.workspaceId, record.id, 'INDUSTRY', industries.values)
+      if (address.length) await setPrimaryAddress(client, 'company_addresses', 'company_id', user.workspaceId, record.id, address.map(({ column, value }) => ({ column, value })))
+      await writeActivity(client, user, request, 'COMPANY_CREATED', record.id, [
+        'name', ...(has(body, 'description') ? ['description'] : []), ...(domains.supplied ? [has(body, 'domains') ? 'domains' : 'domain'] : []), ...(has(body, 'website') ? ['website'] : []),
+        ...(links.supplied ? ['links'] : []), ...(categories.supplied ? ['categories'] : []), ...(industries.supplied ? ['industries'] : []),
+        ...address.map(({ key }) => key), ...(has(body, 'ownerUserId') ? ['ownerUserId'] : []),
+        ...(has(body, 'customerProfile') ? ['customerProfile'] : []), ...(has(body, 'businessRole') ? ['businessRole'] : []),
+      ])
       const created = await client.query(`${COMPANY_SELECT} AND c.id = $2`, [user.workspaceId, record.id])
       return { data: created.rows[0], version: record.version }
     })
@@ -769,7 +1221,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
   app.patch('/api/v1/companies/:id', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const id = recordId(request)
     const body = objectBody(request)
-    rejectUnknown(body, ['version', 'name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'website', 'city'])
+    rejectUnknown(body, ['version', 'name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'domains', 'website', 'links', 'categories', 'industries', 'street', 'city', 'region', 'postalCode', 'countryName', 'countryCode'])
     const expected = expectedVersion(request, body)
     const columns: Array<{ column: string; value: unknown }> = []
     const changed: string[] = []
@@ -778,42 +1230,42 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
     if (has(body, 'ownerUserId')) { columns.push({ column: 'owner_user_id', value: uuid(body.ownerUserId, 'ownerUserId', true) }); changed.push('ownerUserId') }
     if (has(body, 'customerProfile')) { columns.push({ column: 'customer_profile', value: optionalText(body, 'customerProfile', 'customerProfile', 10_000) }); changed.push('customerProfile') }
     if (has(body, 'businessRole')) { columns.push({ column: 'business_role', value: optionalText(body, 'businessRole', 'businessRole', 500) }); changed.push('businessRole') }
-    const domain = has(body, 'domain') ? normalizedDomain(body.domain) : undefined
+    const domains = domainArray(body)
     const website = has(body, 'website') ? canonicalWebsite(body.website) : undefined
-    const city = has(body, 'city') ? optionalText(body, 'city', 'city', 300) : undefined
-    if (domain !== undefined) changed.push('domain')
+    const links = urlArray(body, 'links')
+    const categories = taxonomyValues(body, 'categories', 'COMPANY_CATEGORY')
+    const industries = taxonomyValues(body, 'industries', 'INDUSTRY')
+    const address = addressFields(body)
+    if (domains.supplied) changed.push(has(body, 'domains') ? 'domains' : 'domain')
     if (website !== undefined) changed.push('website')
-    if (city !== undefined) changed.push('city')
+    if (links.supplied) changed.push('links')
+    if (categories.supplied) changed.push('categories')
+    if (industries.supplied) changed.push('industries')
+    changed.push(...address.map(({ key }) => key))
     if (!changed.length) throw new HttpError(400, 'At least one field to update is required.')
     const ownerUserId = columns.find((column) => column.column === 'owner_user_id')?.value as string | null | undefined
     const result = await transaction(pool, async (client) => {
       const current = await client.query('SELECT id FROM companies WHERE workspace_id = $1 AND id = $2', [user.workspaceId, id])
       if (!current.rowCount) throw new HttpError(404, 'Company not found.')
       if (ownerUserId !== undefined) await assertUser(client, user.workspaceId, ownerUserId)
-      if (domain) await duplicateDomain(client, user.workspaceId, domain.normalized, id)
       const version = await bumpRecordVersion(client, user.workspaceId, id, user.actorId, expected)
       await updateSubtype(client, 'companies', user.workspaceId, id, columns)
-      if (domain !== undefined) {
-        const existing = await client.query('SELECT id FROM company_domains WHERE workspace_id = $1 AND company_id = $2 AND is_primary FOR UPDATE', [user.workspaceId, id])
-        if (!domain) {
-          if (existing.rowCount) await client.query('DELETE FROM company_domains WHERE workspace_id = $1 AND id = $2', [user.workspaceId, existing.rows[0].id])
-        } else if (existing.rowCount) {
-          await client.query('UPDATE company_domains SET raw_domain = $3, normalized_domain = $4 WHERE workspace_id = $1 AND id = $2', [user.workspaceId, existing.rows[0].id, domain.raw, domain.normalized])
-        } else {
-          await client.query('INSERT INTO company_domains (workspace_id, company_id, raw_domain, normalized_domain, is_primary) VALUES ($1, $2, $3, $4, true)', [user.workspaceId, id, domain.raw, domain.normalized])
-        }
-      }
+      if (domains.supplied) await replaceCompanyDomains(client, user.workspaceId, id, domains.values)
       if (website !== undefined) {
-        const existing = await client.query('SELECT id FROM company_links WHERE workspace_id = $1 AND company_id = $2 AND is_primary FOR UPDATE', [user.workspaceId, id])
+        await client.query("UPDATE company_links SET is_primary = false WHERE workspace_id = $1 AND company_id = $2 AND lower(kind) <> 'website'", [user.workspaceId, id])
+        const existing = await client.query("SELECT id FROM company_links WHERE workspace_id = $1 AND company_id = $2 AND lower(kind) = 'website' ORDER BY is_primary DESC LIMIT 1 FOR UPDATE", [user.workspaceId, id])
         if (!website) {
           if (existing.rowCount) await client.query('DELETE FROM company_links WHERE workspace_id = $1 AND id = $2', [user.workspaceId, existing.rows[0].id])
         } else if (existing.rowCount) {
-          await client.query('UPDATE company_links SET raw_url = $3, canonical_url = $4 WHERE workspace_id = $1 AND id = $2', [user.workspaceId, existing.rows[0].id, website.raw, website.canonical])
+          await client.query('UPDATE company_links SET raw_url = $3, canonical_url = $4, is_primary = true WHERE workspace_id = $1 AND id = $2', [user.workspaceId, existing.rows[0].id, website.raw, website.canonical])
         } else {
           await client.query("INSERT INTO company_links (workspace_id, company_id, kind, raw_url, canonical_url, is_primary) VALUES ($1, $2, 'WEBSITE', $3, $4, true)", [user.workspaceId, id, website.raw, website.canonical])
         }
       }
-      if (city !== undefined) await setPrimaryAddressCity(client, 'company_addresses', 'company_id', user.workspaceId, id, city)
+      if (links.supplied) await replaceCompanyLinks(client, user.workspaceId, id, links.values)
+      if (categories.supplied) await replaceTaxonomyTerms(client, user.workspaceId, id, 'COMPANY_CATEGORY', categories.values)
+      if (industries.supplied) await replaceTaxonomyTerms(client, user.workspaceId, id, 'INDUSTRY', industries.values)
+      if (address.length) await setPrimaryAddress(client, 'company_addresses', 'company_id', user.workspaceId, id, address.map(({ column, value }) => ({ column, value })))
       await writeActivity(client, user, request, 'COMPANY_UPDATED', id, changed)
       const updated = await client.query(`${COMPANY_SELECT} AND c.id = $2`, [user.workspaceId, id])
       return { data: updated.rows[0], version }
@@ -825,12 +1277,13 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
   app.get('/api/v1/opportunities', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const q = escapedLike(searchText(request))
     const limit = limitValue(request)
+    const offset = offsetValue(request)
     const result = await pool.query(
       `${OPPORTUNITY_SELECT}
        AND ($2::text IS NULL OR o.name ILIKE $2 ESCAPE '\\' OR o.description ILIKE $2 ESCAPE '\\'
             OR EXISTS (SELECT 1 FROM opportunity_companies oc JOIN companies c ON c.workspace_id = oc.workspace_id AND c.id = oc.company_id WHERE oc.workspace_id = o.workspace_id AND oc.opportunity_id = o.id AND c.name ILIKE $2 ESCAPE '\\'))
-       ORDER BY r.updated_at DESC, o.id LIMIT $3`,
-      [user.workspaceId, q, limit],
+        ORDER BY r.updated_at DESC, o.id LIMIT $3 OFFSET $4`,
+      [user.workspaceId, q, limit, offset],
     )
     return reply.send({ items: result.rows })
   }))
@@ -937,11 +1390,12 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
   app.get('/api/v1/notes', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const q = escapedLike(searchText(request))
     const limit = limitValue(request)
+    const offset = offsetValue(request)
     const result = await pool.query(
       `${NOTE_SELECT}
        AND ($2::text IS NULL OR n.title ILIKE $2 ESCAPE '\\' OR n.body_markdown ILIKE $2 ESCAPE '\\')
-       ORDER BY r.updated_at DESC, n.id LIMIT $3`,
-      [user.workspaceId, q, limit],
+       ORDER BY r.updated_at DESC, n.id LIMIT $3 OFFSET $4`,
+      [user.workspaceId, q, limit, offset],
     )
     return reply.send({ items: result.rows })
   }))
