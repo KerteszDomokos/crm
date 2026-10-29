@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import {
   ArrowLeft,
   ArrowUpRight,
@@ -15,11 +16,15 @@ import {
   LoaderCircle,
   LogOut,
   Menu,
+  Pencil,
   Plus,
   Search,
+  Settings,
   ShieldCheck,
   ListChecks,
   MapPin,
+  Star,
+  Tags,
   UsersRound,
   X,
   BriefcaseBusiness,
@@ -60,7 +65,7 @@ type ResourceDefinition<T> = {
   summary?: (records: T[]) => string
 }
 
-type LookupSource = 'people' | 'companies' | 'opportunities' | 'records' | 'users' | 'PERSON_CATEGORY' | 'COMPANY_CATEGORY' | 'INDUSTRY'
+type LookupSource = 'people' | 'companies' | 'opportunities' | 'records' | 'users' | 'cities' | 'PERSON_CATEGORY' | 'COMPANY_CATEGORY' | 'INDUSTRY'
 type LookupOption = { id: string; label: string; subtitle?: string; color?: string; recordType?: string }
 type FormField = {
   name: string
@@ -111,13 +116,23 @@ function getInitials(name?: string) {
   return (name ?? '').trim().split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase() || 'R'
 }
 
-function useResource<T>(resource: string) {
+function useResource<T extends { id: string }>(resource: string) {
   const [records, setRecords] = useState<T[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [refreshToken, setRefreshToken] = useState(0)
 
   const reload = useCallback(() => setRefreshToken((value) => value + 1), [])
+
+  const upsertRecord = useCallback((updated: T) => {
+    setRecords((current) => {
+      const index = current.findIndex((record) => record.id === updated.id)
+      if (index < 0) return [updated, ...current]
+      const next = current.slice()
+      next[index] = { ...current[index], ...updated }
+      return next
+    })
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -139,7 +154,7 @@ function useResource<T>(resource: string) {
     return () => window.removeEventListener('resoloon:workflow-refresh', refresh)
   }, [reload])
 
-  return { records, loading, error, reload }
+  return { records, loading, error, reload, upsertRecord }
 }
 
 function LoadingState({ label = 'Loading your workspace' }: { label?: string }) {
@@ -154,21 +169,73 @@ function ErrorState({ message, onRetry }: { message: string; onRetry: () => void
   return <div className="error-panel" role="alert"><span className="error-mark">!</span><div><strong>Couldn’t load this view</strong><p>{message}</p></div><button type="button" className="button button-ghost button-small" onClick={onRetry}>Try again</button></div>
 }
 
-function MetricCard({ label, value, detail, icon: Icon, tone = 'neutral' }: { label: string; value: string | number; detail: string; icon: typeof UsersRound; tone?: 'neutral' | 'positive' }) {
-  return <article className="metric-card"><div className="metric-top"><span className="eyebrow">{label}</span><span className={`metric-icon ${tone}`}><Icon size={15} /></span></div><div className={`metric-value ${tone === 'positive' ? 'accent' : ''}`}>{value}</div><div className="metric-detail">{detail}</div></article>
+function MetricCard({ label, value, detail, icon: Icon, tone = 'neutral', to }: { label: string; value: string | number; detail: string; icon: typeof UsersRound; tone?: 'neutral' | 'positive'; to?: string }) {
+  const body = <><div className="metric-top"><span className="eyebrow">{label}</span><span className={`metric-icon ${tone}`}><Icon size={15} /></span></div><div className={`metric-value ${tone === 'positive' ? 'accent' : ''}`}>{value}</div><div className="metric-detail">{detail}</div></>
+  return to
+    ? <Link to={to} className={`metric-card metric-card-link${tone === 'positive' ? ' metric-card-positive' : ''}`}>{body}</Link>
+    : <article className="metric-card">{body}</article>
 }
 
-function StagePill({ stage }: { stage?: OpportunityStage }) {
+function StagePill({ stage }: { stage?: OpportunityStage | string }) {
   const value = (stage ?? 'LEAD').toUpperCase()
-  const label = value.charAt(0) + value.slice(1).toLowerCase()
-  return <span className={`stage-pill stage-${value.toLowerCase()}`}><span className="stage-dot" />{label}</span>
+  const label = displayStage(value)
+  return <span className={`stage-pill stage-${value.toLowerCase().replaceAll('_', '-')}`}><span className="stage-dot" />{label}</span>
+}
+
+function ImportanceStars({ value, onChange, readOnly = false, size = 16 }: {
+  value?: number | null
+  onChange?: (next: number | null) => void
+  readOnly?: boolean
+  size?: number
+}) {
+  const current = typeof value === 'number' && value >= 1 && value <= 5 ? Math.round(value) : 0
+  const [hovered, setHovered] = useState(0)
+  const shown = hovered || current
+
+  if (readOnly) {
+    if (!current) return <span className="importance-stars importance-empty" aria-label="No importance set">—</span>
+    return <span className="importance-stars" aria-label={`${current} of 5`}>
+      {Array.from({ length: 5 }, (_, index) => {
+        const rank = index + 1
+        return <Star key={rank} size={size} className={rank <= current ? 'star-filled' : 'star-empty'} fill={rank <= current ? 'currentColor' : 'none'} aria-hidden />
+      })}
+    </span>
+  }
+
+  return <div
+    className="importance-stars importance-stars-input"
+    role="radiogroup"
+    aria-label="Importance"
+    onMouseLeave={() => setHovered(0)}
+  >
+    {Array.from({ length: 5 }, (_, index) => {
+      const rank = index + 1
+      const active = rank <= shown
+      return <button
+        key={rank}
+        type="button"
+        role="radio"
+        aria-checked={current === rank}
+        aria-label={`${rank} star${rank === 1 ? '' : 's'}`}
+        className={`importance-star${active ? ' is-active' : ''}${current === rank ? ' is-selected' : ''}`}
+        onMouseEnter={() => setHovered(rank)}
+        onFocus={() => setHovered(rank)}
+        onBlur={() => setHovered(0)}
+        onClick={() => onChange?.(current === rank ? null : rank)}
+      >
+        <Star size={size} fill={active ? 'currentColor' : 'none'} aria-hidden />
+      </button>
+    })}
+  </div>
 }
 
 function ResourcePage<T extends { id: string }>({ definition }: { definition: ResourceDefinition<T> }) {
-  const { records, loading, error, reload } = useResource<T>(definition.resource)
+  const { records, loading, error, reload, upsertRecord } = useResource<T>(definition.resource)
   const [createOpen, setCreateOpen] = useState(false)
   const [localSearch, setLocalSearch] = useState('')
-  const navigate = useNavigate()
+  const filterInputRef = useRef<HTMLInputElement>(null)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const selectedId = searchParams.get('id')
   const Icon = definition.icon
   const filteredRecords = useMemo(() => {
     if (!localSearch.trim()) return records
@@ -176,21 +243,123 @@ function ResourcePage<T extends { id: string }>({ definition }: { definition: Re
     return records.filter((record) => JSON.stringify(record).toLocaleLowerCase().includes(query))
   }, [localSearch, records])
 
-  return <section className="page-stack">
+  const openRecord = useCallback((id: string) => {
+    const next = new URLSearchParams(searchParams)
+    next.set('id', id)
+    setSearchParams(next, { replace: false })
+  }, [searchParams, setSearchParams])
+
+  const closeRecord = useCallback(() => {
+    const next = new URLSearchParams(searchParams)
+    next.delete('id')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setSearchParams])
+
+  const handleRecordSaved = useCallback((updated: Record<string, unknown> & { id: string }) => {
+    upsertRecord(updated as T)
+  }, [upsertRecord])
+
+  useEffect(() => {
+    function handleFilterShortcut(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null
+      const editingText = !!target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
+      if (event.key === '/' && !editingText && !event.metaKey && !event.ctrlKey && !event.altKey) {
+        event.preventDefault()
+        filterInputRef.current?.focus()
+      }
+    }
+    window.addEventListener('keydown', handleFilterShortcut)
+    return () => window.removeEventListener('keydown', handleFilterShortcut)
+  }, [])
+
+  return <section className={`page-stack resource-page${selectedId ? ' resource-page-drawer-open' : ''}`}>
     <div className="page-heading">
       <div><div className="eyebrow page-eyebrow">Workspace / {definition.plural}</div><h1>{definition.plural}</h1><p>{definition.description}</p></div>
       <button type="button" className="button button-primary" onClick={() => setCreateOpen(true)}><Plus size={16} />Add {definition.singular.toLowerCase()}</button>
     </div>
     <div className="list-panel">
       <div className="list-toolbar"><div className="list-context"><span className="list-icon"><Icon size={16} /></span><div><strong>{definition.plural}</strong><span>{loading ? 'Loading…' : definition.summary?.(records) ?? `${records.length} ${records.length === 1 ? 'record' : 'records'}`}</span></div></div>
-        <label className="inline-search"><Search size={14} /><input value={localSearch} onChange={(event) => setLocalSearch(event.target.value)} placeholder={`Filter ${definition.plural.toLowerCase()}`} aria-label={`Filter ${definition.plural}`} /><kbd>/</kbd></label>
+        <label className="inline-search"><Search size={14} /><input ref={filterInputRef} value={localSearch} onChange={(event) => setLocalSearch(event.target.value)} placeholder={`Filter ${definition.plural.toLowerCase()}`} aria-label={`Filter ${definition.plural}`} /><kbd>/</kbd></label>
       </div>
       {loading ? <LoadingState label={`Loading ${definition.plural.toLowerCase()}…`} /> : error ? <ErrorState message={error} onRetry={reload} /> : filteredRecords.length === 0 ?
         (records.length === 0 ? <EmptyState icon={Icon} title={definition.emptyTitle} description={definition.emptyDescription} action={<button type="button" className="button button-primary" onClick={() => setCreateOpen(true)}><Plus size={15} />Create {definition.singular.toLowerCase()}</button>} /> : <EmptyState icon={Search} title="No matching records" description="Try a different filter, or clear the search to see all records." />) :
-          <div className="table-scroll"><table className="record-table"><thead><tr>{definition.columns.map((column) => <th key={column.label} className={column.className}>{column.label}</th>)}<th aria-label="Open record" /></tr></thead><tbody>{filteredRecords.map((record) => <tr key={record.id} className="click-row" onClick={() => navigate(`/${definition.resource}/${record.id}`)} tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') navigate(`/${definition.resource}/${record.id}`) }}>{definition.columns.map((column, index) => <td key={`${record.id}-${column.label}`} className={`${column.className ?? ''} ${index === 0 ? 'primary-cell' : ''}`}>{column.render(record)}</td>)}<td className="open-cell"><ArrowUpRight size={14} /></td></tr>)}</tbody></table></div>}
+          <div className="table-scroll"><table className="record-table"><thead><tr>{definition.columns.map((column) => <th key={column.label} className={column.className}>{column.label}</th>)}<th aria-label="Open record" /></tr></thead><tbody>{filteredRecords.map((record) => <tr key={record.id} className={`click-row${selectedId === record.id ? ' selected-row' : ''}`} onClick={() => openRecord(record.id)} tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') openRecord(record.id) }}>{definition.columns.map((column, index) => <td key={`${record.id}-${column.label}`} className={`${column.className ?? ''} ${index === 0 ? 'primary-cell' : ''}`}>{index === 0 ? <div className="primary-cell-content">{column.render(record)}</div> : column.render(record)}</td>)}<td className="open-cell"><ArrowUpRight size={14} /></td></tr>)}</tbody></table></div>}
     </div>
     {createOpen && <RecordFormDialog definition={definition} onClose={() => setCreateOpen(false)} onSaved={() => { setCreateOpen(false); reload() }} />}
+    {selectedId && <RecordDrawer definition={definition} recordId={selectedId} onClose={closeRecord} onSaved={handleRecordSaved} />}
   </section>
+}
+
+function RecordDrawer({ definition, recordId, onClose, onSaved }: {
+  definition: ResourceFormDefinition & { plural: string; icon: typeof UsersRound; singular: string; resource: string }
+  recordId: string
+  onClose: () => void
+  onSaved: (updated: Record<string, unknown> & { id: string }) => void
+}) {
+  const [record, setRecord] = useState<Record<string, unknown> | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [token, setToken] = useState(0)
+  useEscapeToClose(onClose)
+
+  useEffect(() => {
+    let active = true
+    setLoading(true)
+    api.get<Record<string, unknown>>(definition.resource, recordId).then((data) => {
+      if (active) { setRecord(data); setError(null) }
+    }).catch((reason: unknown) => {
+      if (active) setError(reason instanceof Error ? reason.message : 'Unable to load this record.')
+    }).finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [definition.resource, recordId, token])
+
+  const title = String(record?.fullName ?? record?.name ?? record?.title ?? definition.singular)
+  const subtitle = String(record?.jobTitle ?? record?.domain ?? record?.email ?? record?.stage ?? definition.plural)
+
+  return <>
+    <button type="button" className="drawer-scrim" aria-label="Close record" onClick={onClose} />
+    <aside className="record-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+      <header className="drawer-header">
+        <div className="drawer-identity">
+          <span className="avatar drawer-avatar">{definition.resource === 'companies' ? <Building2 size={18} /> : getInitials(title)}</span>
+          <div>
+            <div className="eyebrow">{definition.singular}</div>
+            <h2 id="drawer-title">{loading ? 'Loading…' : title}</h2>
+            {!loading && <p className="drawer-subtitle">{subtitle}</p>}
+          </div>
+        </div>
+        <button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={16} /></button>
+      </header>
+      <div className="drawer-body">
+        {loading ? <LoadingState label="Loading record…" /> : error ? <ErrorState message={error} onRetry={() => setToken((value) => value + 1)} /> : record ? <>
+          {record.stage != null && <div className="drawer-stage"><StagePill stage={String(record.stage)} /></div>}
+          {Array.isArray(record.introductionObligations) && record.introductionObligations.length > 0 && <section className="drawer-callout">
+            <span className="eyebrow">Introduction owed</span>
+            {(record.introductionObligations as Array<Record<string, unknown>>).map((obligation, index) => {
+              const introduceTo = String(obligation.introduceToPersonName ?? obligation.targetPersonName ?? 'the next person')
+              return <p key={`${String(obligation.chainId ?? index)}-${String(obligation.position ?? index)}`}>Introduce the team to <strong>{introduceTo}</strong>{obligation.followUpAt ? ` · ${formatDate(String(obligation.followUpAt))}` : ''}</p>
+            })}
+            <Link to="/introductions" className="one-time-link-open" onClick={onClose}>Open introduction chains</Link>
+          </section>}
+          <RecordEditorForm
+            key={`${recordId}-${token}`}
+            definition={definition}
+            record={record}
+            inline
+            stacked
+            onSave={async (values) => {
+              const updated = await api.update<Record<string, unknown> & { id: string }>(definition.resource, recordId, values)
+              setRecord(updated)
+              onSaved({ ...updated, id: String(updated.id ?? recordId) })
+              return updated
+            }}
+            onSaved={() => {}}
+            onReload={() => setToken((value) => value + 1)}
+          />
+        </> : null}
+      </div>
+    </aside>
+  </>
 }
 
 function displayStage(value: string) {
@@ -200,7 +369,14 @@ function displayStage(value: string) {
 function toLookupOptions(source: LookupSource | undefined, payload: unknown): LookupOption[] {
   if (!Array.isArray(payload)) return []
   if (source === 'PERSON_CATEGORY' || source === 'COMPANY_CATEGORY' || source === 'INDUSTRY') {
-    return (payload as TaxonomyRecord[]).map((item) => ({ id: item.label, label: item.label }))
+    return (payload as TaxonomyRecord[]).map((item) => ({ id: item.label, label: item.label, color: item.color }))
+  }
+  if (source === 'cities') {
+    return (payload as Array<{ id?: string; label?: string; subtitle?: string }>).flatMap((item) => {
+      const label = String(item.label ?? item.id ?? '').trim()
+      if (!label) return []
+      return [{ id: label, label, subtitle: item.subtitle }]
+    })
   }
   if (source === 'users') return (payload as WorkspaceUser[]).map((item) => ({ id: item.id, label: item.fullName, subtitle: item.email }))
   if (source === 'records') return (payload as SearchResult[]).map((item) => ({ id: item.id, label: item.title ?? item.name ?? 'Record', subtitle: item.recordType ?? item.type, recordType: item.recordType ?? item.type }))
@@ -214,6 +390,7 @@ async function loadLookupOptions(source: LookupSource, query: string): Promise<L
   if (source === 'users') return toLookupOptions(source, await api.listWorkspaceUsers(query))
   if (source === 'PERSON_CATEGORY' || source === 'COMPANY_CATEGORY' || source === 'INDUSTRY') return toLookupOptions(source, await api.listTaxonomies(source, query))
   if (source === 'records') return query.trim().length >= 2 ? toLookupOptions(source, await api.search(query)) : []
+  if (source === 'cities') return query.trim().length >= 2 ? toLookupOptions(source, await api.searchCities(query)) : []
   return toLookupOptions(source, await api.listLookup(source, query))
 }
 
@@ -233,11 +410,13 @@ function SearchablePicker({
   const listId = useId()
   const rootRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const popoverRef = useRef<HTMLDivElement>(null)
   const [query, setQuery] = useState('')
   const [remoteOptions, setRemoteOptions] = useState<LookupOption[]>([])
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)
   const [highlighted, setHighlighted] = useState(0)
+  const [menuBox, setMenuBox] = useState<{ top: number; left: number; width: number } | null>(null)
 
   useEffect(() => {
     if (!source) { setRemoteOptions([]); return }
@@ -249,60 +428,191 @@ function SearchablePicker({
     return () => { active = false; window.clearTimeout(timer) }
   }, [source, query])
 
+  useLayoutEffect(() => {
+    if (!open || !rootRef.current) { setMenuBox(null); return }
+    function place() {
+      const rect = rootRef.current?.getBoundingClientRect()
+      if (!rect) return
+      const width = Math.min(Math.max(rect.width, 240), Math.min(420, window.innerWidth - 16))
+      const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8)
+      const below = rect.bottom + 6
+      const estimated = 240
+      const top = below + estimated > window.innerHeight - 8
+        ? Math.max(8, rect.top - estimated - 6)
+        : below
+      setMenuBox({ top, left, width })
+    }
+    place()
+    window.addEventListener('resize', place)
+    window.addEventListener('scroll', place, true)
+    return () => {
+      window.removeEventListener('resize', place)
+      window.removeEventListener('scroll', place, true)
+    }
+  }, [open, query, selected.length, loading])
+
   useEffect(() => {
+    if (!open) return
     function closeOutside(event: MouseEvent) {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+      const target = event.target as Node
+      if (rootRef.current?.contains(target) || popoverRef.current?.contains(target)) return
+      setOpen(false)
     }
     document.addEventListener('mousedown', closeOutside)
     return () => document.removeEventListener('mousedown', closeOutside)
-  }, [])
+  }, [open])
 
   const baseOptions = source ? remoteOptions : options
   const displayedSelected = selected.map((item) => {
     const match = baseOptions.find((option) => option.id === item.id)
-    return match ? { ...item, label: match.label, subtitle: match.subtitle, color: match.color } : item
+    return {
+      id: item.id,
+      label: (match?.label || item.label || item.id || '').trim() || 'Selected',
+      subtitle: match?.subtitle ?? item.subtitle,
+      color: match?.color ?? item.color,
+      recordType: match?.recordType ?? item.recordType,
+    }
   })
   const filtered = baseOptions.filter((item) => {
     const match = `${item.label} ${item.subtitle ?? ''}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
     return match && !selected.some((chosen) => chosen.id === item.id)
   })
   const canAddCustom = allowCustom && query.trim().length > 0 && ![...baseOptions, ...selected].some((item) => item.label.toLocaleLowerCase() === query.trim().toLocaleLowerCase())
-  const rows = [...filtered, ...(canAddCustom ? [{ id: `__custom__${query.trim()}`, label: `Add “${query.trim()}”`, subtitle: 'Use this value', customValue: query.trim() } as LookupOption & { customValue: string }] : [])]
+  const rows = [...filtered, ...(canAddCustom ? [{ id: `__custom__${query.trim()}`, label: `Add “${query.trim()}”`, subtitle: 'Create this value', customValue: query.trim() } as LookupOption & { customValue: string }] : [])]
 
   function choose(item: LookupOption & { customValue?: string }) {
-    const value = item.customValue ? { id: item.customValue, label: item.customValue } : { id: item.id, label: item.label, subtitle: item.subtitle, color: item.color, recordType: item.recordType }
+    const value: LookupOption = item.customValue
+      ? { id: item.customValue, label: item.customValue }
+      : { id: item.id, label: item.label || item.id, subtitle: item.subtitle, color: item.color, recordType: item.recordType }
+    if (!value.id || !value.label) return
+    if (selected.some((chosen) => chosen.id === value.id || chosen.label.toLocaleLowerCase() === value.label.toLocaleLowerCase())) {
+      setQuery('')
+      setOpen(false)
+      return
+    }
     onChange(multiple ? [...selected, value] : [value])
     setQuery('')
     setHighlighted(0)
     setOpen(false)
-    if (multiple) inputRef.current?.focus()
+    if (multiple) requestAnimationFrame(() => inputRef.current?.focus())
   }
 
   function onKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
-    if (event.key === 'ArrowDown') { event.preventDefault(); setOpen(true); setHighlighted((index) => rows.length ? (index + 1) % rows.length : 0) }
-    else if (event.key === 'ArrowUp') { event.preventDefault(); setOpen(true); setHighlighted((index) => rows.length ? (index - 1 + rows.length) % rows.length : 0) }
-    else if (event.key === 'Enter') {
+    if (event.nativeEvent.isComposing) return
+    if (event.key === 'ArrowDown') {
       event.preventDefault()
-      if (!open) setOpen(true)
-      else if (rows[highlighted]) choose(rows[highlighted])
-    } else if (event.key === 'Escape') { setOpen(false); setQuery('') }
-    else if (event.key === 'Backspace' && !query && selected.length) onChange(selected.slice(0, -1))
+      setOpen(true)
+      setHighlighted((index) => rows.length ? (index + 1) % rows.length : 0)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setOpen(true)
+      setHighlighted((index) => rows.length ? (index - 1 + rows.length) % rows.length : 0)
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      event.stopPropagation()
+      if (!open) { setOpen(true); return }
+      if (!loading && rows[highlighted]) choose(rows[highlighted])
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      setOpen(false)
+      setQuery('')
+    } else if (event.key === 'Backspace' && !query && selected.length) {
+      onChange(selected.slice(0, -1))
+    }
   }
 
-  return <div className={`search-picker${disabled ? ' is-disabled' : ''}`} ref={rootRef}>
+  const menu = open && !disabled && menuBox && createPortal(
+    <div
+      ref={popoverRef}
+      className="picker-popover picker-popover-portal"
+      style={{ top: menuBox.top, left: menuBox.left, width: menuBox.width }}
+    >
+      <ul id={listId} role="listbox" aria-label={`${label} options`} aria-multiselectable={multiple || undefined}>
+        {loading && <li className="picker-empty" role="presentation"><LoaderCircle size={13} className="spin" />Searching…</li>}
+        {!loading && rows.map((item, index) => {
+          const already = selected.some((choice) => choice.id === item.id)
+          return <li
+            key={`${item.id}-${index}`}
+            id={`${listId}-${index}`}
+            role="option"
+            aria-selected={already || index === highlighted}
+            className={`picker-option${index === highlighted ? ' is-highlighted' : ''}${already ? ' is-selected' : ''}`}
+            onMouseEnter={() => setHighlighted(index)}
+            onMouseDown={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              choose(item)
+            }}
+          >
+            <span><strong>{item.label}</strong>{item.subtitle && <small>{item.subtitle}</small>}</span>
+            {already ? <Check size={13} /> : null}
+          </li>
+        })}
+        {!loading && rows.length === 0 && <li className="picker-empty" role="presentation">{query ? (allowCustom ? 'No matches. Press Enter to add this value.' : 'No matches.') : `Start typing to search ${label.toLowerCase()}.`}</li>}
+      </ul>
+    </div>,
+    document.body,
+  )
+
+  return <div className={`search-picker${disabled ? ' is-disabled' : ''}${selected.length ? ' has-selection' : ''}`} ref={rootRef}>
     <div className="picker-control" onClick={() => { if (!disabled) { setOpen(true); inputRef.current?.focus() } }}>
-      {displayedSelected.map((item, index) => <span className={`picker-chip${item.color ? ' taxonomy-picker-chip' : ''}`} key={`${item.id}-${index}`} style={item.color ? { color: item.color, borderColor: `${item.color}66`, backgroundColor: `${item.color}22` } : undefined}><span>{item.label}</span><button type="button" aria-label={`Remove ${item.label}`} onClick={(event) => { event.stopPropagation(); onChange(selected.filter((_, itemIndex) => itemIndex !== index)) }} disabled={disabled}><X size={12} /></button></span>)}
-      <input ref={inputRef} role="combobox" aria-label={label} aria-expanded={open} aria-controls={listId} aria-autocomplete="list" aria-activedescendant={open && rows[highlighted] ? `${listId}-${highlighted}` : undefined} value={query} disabled={disabled} placeholder={selected.length && multiple ? '' : placeholder ?? `Search ${label.toLowerCase()}…`} onFocus={() => setOpen(true)} onChange={(event) => { setQuery(event.target.value); setHighlighted(0); setOpen(true) }} onKeyDown={onKeyDown} />
-      {selected.length > 0 && !multiple && <button className="picker-clear" type="button" aria-label={`Clear ${label}`} onClick={(event) => { event.stopPropagation(); onChange([]); setQuery(''); inputRef.current?.focus() }} disabled={disabled}><X size={13} /></button>}
+      {displayedSelected.map((item, index) => (
+        <span
+          className={`picker-chip${item.color ? ' taxonomy-picker-chip' : ''}`}
+          key={`${item.id}-${index}`}
+          style={item.color ? { color: item.color, borderColor: `${item.color}66`, backgroundColor: `${item.color}22` } : undefined}
+          title={item.label}
+        >
+          <span>{item.label}</span>
+          <button
+            type="button"
+            aria-label={`Remove ${item.label}`}
+            onClick={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              onChange(selected.filter((_, itemIndex) => itemIndex !== index))
+            }}
+            disabled={disabled}
+          >
+            <X size={12} />
+          </button>
+        </span>
+      ))}
+      <input
+        ref={inputRef}
+        role="combobox"
+        aria-label={label}
+        aria-expanded={open}
+        aria-controls={listId}
+        aria-autocomplete="list"
+        aria-activedescendant={open && rows[highlighted] ? `${listId}-${highlighted}` : undefined}
+        autoComplete="off"
+        autoCorrect="off"
+        spellCheck={false}
+        value={query}
+        disabled={disabled}
+        placeholder={selected.length ? (multiple ? 'Add another…' : 'Search to replace…') : (placeholder ?? `Search ${label.toLowerCase()}…`)}
+        onFocus={() => setOpen(true)}
+        onChange={(event) => { setQuery(event.target.value); setHighlighted(0); setOpen(true) }}
+        onKeyDown={onKeyDown}
+      />
+      {selected.length > 0 && !multiple && (
+        <button
+          className="picker-clear"
+          type="button"
+          aria-label={`Clear ${label}`}
+          onClick={(event) => { event.preventDefault(); event.stopPropagation(); onChange([]); setQuery(''); inputRef.current?.focus() }}
+          disabled={disabled}
+        >
+          <X size={13} />
+        </button>
+      )}
       <ChevronDown size={14} className="picker-chevron" />
     </div>
-    {open && !disabled && <div className="picker-popover"><ul id={listId} role="listbox" aria-label={`${label} options`} aria-multiselectable={multiple || undefined}>
-      {loading && <li className="picker-empty" role="presentation"><LoaderCircle size={13} className="spin" />Searching…</li>}
-      {!loading && rows.map((item, index) => <li key={`${item.id}-${index}`} id={`${listId}-${index}`} role="option" aria-selected={selected.some((choice) => choice.id === item.id)} className={index === highlighted ? 'picker-option is-highlighted' : 'picker-option'} onMouseEnter={() => setHighlighted(index)} onMouseDown={(event) => event.preventDefault()} onClick={() => choose(item)}><span><strong>{item.label}</strong>{item.subtitle && <small>{item.subtitle}</small>}</span>{index === highlighted && <Check size={13} />}</li>)}
-      {!loading && rows.length === 0 && <li className="picker-empty" role="presentation">{query ? 'No matches. Keep typing to add a value.' : `No ${label.toLowerCase()} available.`}</li>}
-    </ul></div>}
+    {menu}
   </div>
 }
+
 
 function listAsStrings(value: unknown): string[] {
   if (!Array.isArray(value)) return []
@@ -342,17 +652,39 @@ function relatedChoices(field: FormField, record?: Record<string, unknown>): Loo
 function fieldInitialValue(field: FormField, record?: Record<string, unknown>): unknown {
   if (!record) {
     if (field.options?.length) return [{ id: field.options[0], label: displayStage(field.options[0]) }]
+    if (field.type === 'stars') return null
     return field.type === 'picker' || field.type === 'links' ? [] : ''
   }
   const name = field.name
-  if (field.type === 'links') return Array.isArray(record.links) ? record.links as RecordLink[] : []
+  if (field.type === 'stars') {
+    const raw = record[name]
+    const rank = typeof raw === 'number' ? raw : Number(raw)
+    return Number.isFinite(rank) && rank >= 1 && rank <= 5 ? Math.round(rank) : null
+  }
+  if (field.type === 'links') return normalizeRecordLinks(record.links)
   if (field.options) {
     const raw = record[name] ?? (name === 'noteType' ? record.type : undefined) ?? field.options[0]
     const option = String(raw)
     return [{ id: option, label: displayStage(option) }]
   }
   if (field.type === 'picker') {
-    if (field.source === 'PERSON_CATEGORY' || field.source === 'COMPANY_CATEGORY' || field.source === 'INDUSTRY' || !field.source) {
+    if (field.source === 'cities') {
+      const city = typeof record[name] === 'string' ? record[name].trim() : ''
+      return city ? [{ id: city, label: city }] : []
+    }
+    if (field.source === 'PERSON_CATEGORY' || field.source === 'COMPANY_CATEGORY' || field.source === 'INDUSTRY') {
+      const raw = Array.isArray(record[name]) ? record[name] as Array<string | { label?: string; color?: string; id?: string }> : []
+      return raw.flatMap((item) => {
+        if (typeof item === 'string' && item.trim()) return [{ id: item.trim(), label: item.trim() }]
+        if (item && typeof item === 'object') {
+          const label = String(item.label ?? '').trim()
+          if (!label) return []
+          return [{ id: label, label, color: typeof item.color === 'string' ? item.color : undefined }]
+        }
+        return []
+      })
+    }
+    if (!field.source) {
       let values: string[] = []
       if (name === 'emails') values = listAsStrings(record.emails).length ? listAsStrings(record.emails) : [record.primaryEmail ?? record.email].filter((item): item is string => typeof item === 'string' && Boolean(item))
       else if (name === 'phones') values = listAsStrings(record.phones).length ? listAsStrings(record.phones) : [record.phone ?? record.primaryPhone].filter((item): item is string => typeof item === 'string' && Boolean(item))
@@ -379,7 +711,6 @@ function fieldInitialValue(field: FormField, record?: Record<string, unknown>): 
       const nestedName = record.name as { firstName?: string; lastName?: string }
       value = [nestedName.firstName, nestedName.lastName].filter(Boolean).join(' ')
     }
-    else if (name === 'street' || name === 'region' || name === 'postalCode' || name === 'countryName' || name === 'countryCode') value = ''
     else if (name === 'startAt' || name === 'endAt') value = record[name === 'startAt' ? 'startsAt' : 'endsAt']
   }
   if (value != null && (field.type === 'date' || name === 'expectedCloseDate' || name === 'followUpDate' || name === 'dueAt')) return String(value).slice(0, 10)
@@ -390,16 +721,351 @@ function fieldInitialValue(field: FormField, record?: Record<string, unknown>): 
   return value == null ? '' : String(value)
 }
 
+function normalizeRecordLinks(raw: unknown): RecordLink[] {
+  if (!Array.isArray(raw)) return []
+  return raw.flatMap((item) => {
+    if (typeof item === 'string' && item.trim()) return [{ kind: 'other', url: item.trim() }]
+    if (item && typeof item === 'object') {
+      const link = item as Record<string, unknown>
+      const url = typeof link.url === 'string' ? link.url.trim() : typeof link.rawUrl === 'string' ? link.rawUrl.trim() : ''
+      if (!url) return []
+      const kind = typeof link.kind === 'string' && link.kind.trim() ? link.kind.trim() : 'other'
+      const label = typeof link.label === 'string' && link.label.trim() ? link.label.trim() : undefined
+      return [{ kind, url, ...(label ? { label } : {}) }]
+    }
+    return []
+  })
+}
+
 function LinkEditor({ links, onChange }: { links: RecordLink[]; onChange: (links: RecordLink[]) => void }) {
   return <div className="link-editor">
     {links.map((link, index) => <div className="link-editor-row" key={index}>
-      <input aria-label={`Link ${index + 1} type`} value={link.kind} placeholder="Type (website, X…)" onChange={(event) => onChange(links.map((item, itemIndex) => itemIndex === index ? { ...item, kind: event.target.value } : item))} />
-      <input aria-label={`Link ${index + 1} URL`} type="url" value={link.url} placeholder="https://…" onChange={(event) => onChange(links.map((item, itemIndex) => itemIndex === index ? { ...item, url: event.target.value } : item))} />
+      <input aria-label={`Link ${index + 1} URL`} type="url" value={link.url} placeholder="https://…" onChange={(event) => onChange(links.map((item, itemIndex) => itemIndex === index ? { ...item, url: event.target.value, kind: item.kind || 'other' } : item))} />
       <input aria-label={`Link ${index + 1} label`} value={link.label ?? ''} placeholder="Label (optional)" onChange={(event) => onChange(links.map((item, itemIndex) => itemIndex === index ? { ...item, label: event.target.value } : item))} />
       <button type="button" className="icon-button link-remove" aria-label={`Remove link ${index + 1}`} onClick={() => onChange(links.filter((_, itemIndex) => itemIndex !== index))}><X size={14} /></button>
     </div>)}
-    <button type="button" className="button button-ghost button-small" onClick={() => onChange([...links, { kind: '', url: '', label: '' }])}><Plus size={13} />Add link</button>
+    <button type="button" className="button button-ghost button-small" onClick={() => onChange([...links, { kind: 'other', url: '', label: '' }])}><Plus size={13} />Add link</button>
   </div>
+}
+
+function taxonomyLabels(values?: Array<string | { label?: string; color?: string }> | null) {
+  if (!values?.length) return '—'
+  return values.map((item) => typeof item === 'string' ? item : item.label ?? '—').filter(Boolean).join(', ')
+}
+
+function TaxonomyBadges({ values }: { values?: Array<string | { label?: string; color?: string }> | null }) {
+  if (!values?.length) return <span className="cell-muted">—</span>
+  return <span className="taxonomy-badges">
+    {values.map((item, index) => {
+      const label = typeof item === 'string' ? item : item.label ?? '—'
+      const color = typeof item === 'string' ? undefined : item.color
+      return <span key={`${label}-${index}`} className="taxonomy-badge" style={color ? { ['--taxonomy-color' as string]: color } : undefined}>{label}</span>
+    })}
+  </span>
+}
+
+const CATEGORY_COLOR_PRESETS = ['#00CF7F', '#6B8E7C', '#5B8DEF', '#F0A202', '#E4572E', '#9B5DE5', '#00BBF9', '#F15BB5']
+
+function SettingsCategoriesPage() {
+  type TaxonomyKind = TaxonomyRecord['taxonomy']
+  type CategoryDraft = { id: string; label: string; color: string; isActive: boolean; isNew?: boolean }
+  const tabs: Array<{ id: TaxonomyKind; label: string; hint: string }> = [
+    { id: 'PERSON_CATEGORY', label: 'People', hint: 'Tags you attach to people in your network.' },
+    { id: 'COMPANY_CATEGORY', label: 'Companies', hint: 'How you classify organizations.' },
+    { id: 'INDUSTRY', label: 'Industries', hint: 'Industry labels for companies.' },
+  ]
+  const [tab, setTab] = useState<TaxonomyKind>('PERSON_CATEGORY')
+  const [savedTerms, setSavedTerms] = useState<TaxonomyRecord[]>([])
+  const [drafts, setDrafts] = useState<CategoryDraft[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [status, setStatus] = useState('')
+  const [refreshToken, setRefreshToken] = useState(0)
+  const [saving, setSaving] = useState(false)
+  const [newLabel, setNewLabel] = useState('')
+  const [newColor, setNewColor] = useState(CATEGORY_COLOR_PRESETS[0])
+
+  useEffect(() => {
+    let active = true
+    setLoading(true)
+    setError(null)
+    setActionError(null)
+    setStatus('')
+    api.listAdminTaxonomies(tab).then((items) => {
+      if (!active) return
+      setSavedTerms(items)
+      setDrafts(items.map((item) => ({
+        id: item.id,
+        label: item.label,
+        color: item.color ?? '#6B8E7C',
+        isActive: item.isActive !== false,
+      })))
+    }).catch((reason: unknown) => {
+      if (active) setError(reason instanceof Error ? reason.message : 'Unable to load categories.')
+    }).finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [tab, refreshToken])
+
+  const dirtyCount = useMemo(() => {
+    let count = 0
+    for (const draft of drafts) {
+      if (draft.isNew) {
+        if (draft.label.trim()) count += 1
+        continue
+      }
+      const original = savedTerms.find((term) => term.id === draft.id)
+      if (!original) continue
+      const originalActive = original.isActive !== false
+      if (
+        draft.label.trim() !== original.label
+        || draft.color.toLowerCase() !== (original.color ?? '#6B8E7C').toLowerCase()
+        || draft.isActive !== originalActive
+      ) count += 1
+    }
+    return count
+  }, [drafts, savedTerms])
+
+  function updateDraft(id: string, patch: Partial<Pick<CategoryDraft, 'label' | 'color' | 'isActive'>>) {
+    setDrafts((current) => current.map((item) => item.id === id ? { ...item, ...patch } : item))
+    setActionError(null)
+    setStatus('')
+  }
+
+  function stageNewCategory(event: FormEvent) {
+    event.preventDefault()
+    const label = newLabel.trim()
+    if (!label) { setActionError('Give the category a name.'); return }
+    if (drafts.some((item) => item.label.trim().toLocaleLowerCase() === label.toLocaleLowerCase())) {
+      setActionError('That category name is already in this list.')
+      return
+    }
+    setDrafts((current) => [...current, {
+      id: `new-${crypto.randomUUID()}`,
+      label,
+      color: newColor,
+      isActive: true,
+      isNew: true,
+    }])
+    setNewLabel('')
+    setNewColor(CATEGORY_COLOR_PRESETS[(CATEGORY_COLOR_PRESETS.indexOf(newColor) + 1) % CATEGORY_COLOR_PRESETS.length] ?? CATEGORY_COLOR_PRESETS[0])
+    setActionError(null)
+    setStatus('')
+  }
+
+  function discardChanges() {
+    setDrafts(savedTerms.map((item) => ({
+      id: item.id,
+      label: item.label,
+      color: item.color ?? '#6B8E7C',
+      isActive: item.isActive !== false,
+    })))
+    setActionError(null)
+    setStatus('Changes discarded.')
+  }
+
+  function changeTab(next: TaxonomyKind) {
+    if (next === tab) return
+    if (dirtyCount > 0 && !window.confirm('You have unsaved category changes. Leave without saving?')) return
+    setTab(next)
+    setNewLabel('')
+  }
+
+  async function saveAll() {
+    const normalized = drafts.map((draft) => ({ ...draft, label: draft.label.trim() }))
+    if (normalized.some((draft) => !draft.label)) {
+      setActionError('Every category needs a name.')
+      return
+    }
+    if (normalized.some((draft) => !/^#[0-9A-Fa-f]{6}$/.test(draft.color))) {
+      setActionError('Every category needs a valid hex color.')
+      return
+    }
+    const labels = normalized.map((draft) => draft.label.toLocaleLowerCase())
+    if (new Set(labels).size !== labels.length) {
+      setActionError('Category names must be unique.')
+      return
+    }
+
+    const creates = normalized.filter((draft) => draft.isNew)
+    const updates = normalized.flatMap((draft) => {
+      if (draft.isNew) return []
+      const original = savedTerms.find((term) => term.id === draft.id)
+      if (!original) return []
+      const originalActive = original.isActive !== false
+      const changed = draft.label !== original.label
+        || draft.color.toLowerCase() !== (original.color ?? '#6B8E7C').toLowerCase()
+        || draft.isActive !== originalActive
+      return changed ? [draft] : []
+    })
+
+    if (!creates.length && !updates.length) {
+      setStatus('Nothing to save.')
+      return
+    }
+
+    setSaving(true)
+    setActionError(null)
+    setStatus('')
+    try {
+      await Promise.all([
+        ...creates.map((draft) => api.createTaxonomy({ taxonomy: tab, label: draft.label, color: draft.color })),
+        ...updates.map((draft) => api.updateTaxonomy(draft.id, {
+          label: draft.label,
+          color: draft.color,
+          isActive: draft.isActive,
+        })),
+      ])
+      setStatus(`Saved ${creates.length + updates.length} categor${creates.length + updates.length === 1 ? 'y' : 'ies'}.`)
+      setRefreshToken((value) => value + 1)
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Unable to save categories.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const activeTab = tabs.find((item) => item.id === tab) ?? tabs[0]
+
+  return <section className="page-stack settings-page">
+    <div className="page-heading">
+      <div>
+        <div className="eyebrow page-eyebrow">Workspace / Settings</div>
+        <h1>Categories</h1>
+        <p>Edit names and colors freely, then save once when the list looks right.</p>
+      </div>
+      <div className="page-heading-actions">
+        <button type="button" className="button button-ghost" disabled={saving || dirtyCount === 0} onClick={discardChanges}>Discard</button>
+        <button type="button" className="button button-primary" disabled={saving || dirtyCount === 0} onClick={() => void saveAll()}>
+          {saving ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}
+          {dirtyCount > 0 ? `Save ${dirtyCount} change${dirtyCount === 1 ? '' : 's'}` : 'Save changes'}
+        </button>
+      </div>
+    </div>
+
+    <div className="settings-tabs" role="tablist" aria-label="Category types">
+      {tabs.map((item) => <button
+        key={item.id}
+        type="button"
+        role="tab"
+        aria-selected={tab === item.id}
+        className={`settings-tab${tab === item.id ? ' is-active' : ''}`}
+        onClick={() => changeTab(item.id)}
+      >{item.label}</button>)}
+    </div>
+
+    <div className="list-panel settings-panel">
+      <div className="list-toolbar">
+        <div className="list-context">
+          <span className="list-icon"><Tags size={16} /></span>
+          <div>
+            <strong>{activeTab.label} categories</strong>
+            <span>{activeTab.hint}</span>
+          </div>
+        </div>
+        {(status || dirtyCount > 0) && <span className="editor-status settings-status">{status || `${dirtyCount} unsaved change${dirtyCount === 1 ? '' : 's'}`}</span>}
+      </div>
+
+      {actionError && <div className="form-error settings-inline-error" role="alert">{actionError}</div>}
+
+      {loading ? <LoadingState label="Loading categories…" /> : error ? <ErrorState message={error} onRetry={() => setRefreshToken((value) => value + 1)} /> : <>
+        <div className="category-rows">
+          {drafts.length === 0 && <EmptyState icon={Tags} title="No categories yet" description="Add the first one below. Keep names short and colors distinct." />}
+          {drafts.map((draft) => {
+            const inactive = !draft.isActive
+            return <article className={`category-row${inactive ? ' is-inactive' : ''}${draft.isNew ? ' is-new' : ''}`} key={draft.id}>
+              <label className="category-color">
+                <span className="sr-only">Color</span>
+                <input type="color" value={draft.color} onChange={(event) => updateDraft(draft.id, { color: event.target.value })} disabled={saving} />
+                <span className="category-color-swatch" style={{ background: draft.color }} />
+              </label>
+              <input
+                className="category-label-input"
+                value={draft.label}
+                aria-label="Category name"
+                onChange={(event) => updateDraft(draft.id, { label: event.target.value })}
+                disabled={saving}
+              />
+              <div className="category-presets" aria-label="Color presets">
+                {CATEGORY_COLOR_PRESETS.map((color) => <button
+                  key={color}
+                  type="button"
+                  className={`category-preset${draft.color.toLowerCase() === color.toLowerCase() ? ' is-selected' : ''}`}
+                  style={{ background: color }}
+                  aria-label={`Use ${color}`}
+                  onClick={() => updateDraft(draft.id, { color })}
+                  disabled={saving}
+                />)}
+              </div>
+              <div className="category-row-actions">
+                {draft.isNew ? <button type="button" className="button button-ghost button-small" disabled={saving} onClick={() => setDrafts((current) => current.filter((item) => item.id !== draft.id))}>Remove</button>
+                  : <button type="button" className="button button-ghost button-small" disabled={saving} onClick={() => updateDraft(draft.id, { isActive: !draft.isActive })}>
+                    {inactive ? 'Reactivate' : 'Hide'}
+                  </button>}
+              </div>
+            </article>
+          })}
+        </div>
+
+        <form className="category-create" onSubmit={stageNewCategory}>
+          <label className="category-color">
+            <span className="sr-only">New category color</span>
+            <input type="color" value={newColor} onChange={(event) => setNewColor(event.target.value)} disabled={saving} />
+            <span className="category-color-swatch" style={{ background: newColor }} />
+          </label>
+          <input
+            className="category-label-input"
+            value={newLabel}
+            onChange={(event) => setNewLabel(event.target.value)}
+            placeholder={`New ${activeTab.label.toLowerCase()} category`}
+            aria-label="New category name"
+            disabled={saving}
+          />
+          <div className="category-presets" aria-label="New category color presets">
+            {CATEGORY_COLOR_PRESETS.map((color) => <button
+              key={color}
+              type="button"
+              className={`category-preset${newColor.toLowerCase() === color.toLowerCase() ? ' is-selected' : ''}`}
+              style={{ background: color }}
+              aria-label={`Use ${color}`}
+              onClick={() => setNewColor(color)}
+              disabled={saving}
+            />)}
+          </div>
+          <button type="submit" className="button button-ghost" disabled={saving || !newLabel.trim()}>
+            <Plus size={15} />
+            Add to list
+          </button>
+        </form>
+      </>}
+    </div>
+  </section>
+}
+
+function humanizeActivity(action: string, recordName?: string | null, actorName?: string | null) {
+  const labels: Record<string, string> = {
+    PERSON_CREATED: 'Person created',
+    PERSON_UPDATED: 'Person updated',
+    COMPANY_CREATED: 'Company created',
+    COMPANY_UPDATED: 'Company updated',
+    OPPORTUNITY_CREATED: 'Opportunity created',
+    OPPORTUNITY_UPDATED: 'Opportunity updated',
+    NOTE_CREATED: 'Note created',
+    NOTE_UPDATED: 'Note updated',
+    FOLLOW_UP_CREATED: 'Follow-up created',
+    FOLLOW_UP_COMPLETED: 'Follow-up completed',
+    FOLLOW_UP_CANCELLED: 'Follow-up cancelled',
+    LOCAL_EVENT_CREATED: 'Event created',
+    LOCAL_EVENT_UPDATED: 'Event updated',
+    MEETING_NOTE_COMPLETED: 'Meeting note completed',
+    MEETING_NOTE_CANCELLED: 'Meeting note cancelled',
+    INTRODUCTION_CREATED: 'Warm introduction planned',
+    RECORD_IMPORTED: 'Imported from legacy CSV',
+    RECORD_IMPORTED_UPDATE: 'Updated from legacy CSV',
+  }
+  const title = labels[action] ?? action.replaceAll('_', ' ').toLowerCase().replace(/^\w/, (char) => char.toUpperCase())
+  const detail = [recordName, actorName ? `by ${actorName}` : null].filter(Boolean).join(' · ')
+  return { title, detail: detail || 'Workspace update' }
 }
 
 function MarkdownField({ value, onChange, label, placeholder }: { value: string; onChange: (value: string) => void; label: string; placeholder?: string }) {
@@ -460,10 +1126,11 @@ function DateQuickInput({
   </div>
 }
 
-function RecordEditorForm({ definition, record, inline = false, onSave, onCancel, onSaved, onReload }: {
+function RecordEditorForm({ definition, record, inline = false, stacked = false, onSave, onCancel, onSaved, onReload }: {
   definition: ResourceFormDefinition
   record?: Record<string, unknown>
   inline?: boolean
+  stacked?: boolean
   onSave: (values: Record<string, unknown>) => Promise<unknown>
   onCancel?: () => void
   onSaved: () => void
@@ -474,34 +1141,59 @@ function RecordEditorForm({ definition, record, inline = false, onSave, onCancel
   const [error, setError] = useState<string | null>(null)
   const [status, setStatus] = useState('')
   const [conflict, setConflict] = useState(false)
+  const [recordSnapshot, setRecordSnapshot] = useState<Record<string, unknown> | undefined>(record)
+
+  useEffect(() => {
+    setRecordSnapshot(record)
+  }, [record])
 
   function setValue(name: string, value: unknown) { setValues((current) => ({ ...current, [name]: value })); setStatus(''); setError(null) }
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setPending(true); setError(null); setStatus(''); setConflict(false)
     const payload: Record<string, unknown> = {}
-    if (record && record.version != null) payload.version = record.version
+    if (recordSnapshot && recordSnapshot.version != null) payload.version = recordSnapshot.version
     try {
       definition.fields.forEach((field) => {
         const value = values[field.name]
-        if (field.type === 'picker') {
+        if (field.type === 'stars') {
+          payload[field.name] = typeof value === 'number' && value >= 1 && value <= 5 ? value : recordSnapshot ? null : undefined
+        } else if (field.type === 'picker') {
           const selected = (Array.isArray(value) ? value : []) as LookupOption[]
-          payload[field.name] = field.multiple ? selected.map((item) => item.id) : selected[0]?.id ?? (record ? null : undefined)
+          payload[field.name] = field.multiple ? selected.map((item) => item.id) : selected[0]?.id ?? (recordSnapshot ? null : undefined)
         } else if (field.type === 'links') {
-          payload.links = (Array.isArray(value) ? value as RecordLink[] : []).filter((link) => link.kind.trim() && link.url.trim()).map((link) => ({ kind: link.kind.trim(), url: link.url.trim(), ...(link.label?.trim() ? { label: link.label.trim() } : {}) }))
+          // API currently expects URL strings; keep local editing as objects for labels.
+          payload.links = normalizeRecordLinks(value).map((link) => link.url)
         } else if (field.options) {
           const selected = (Array.isArray(value) ? value : []) as LookupOption[]
           payload[field.name] = selected[0]?.id ?? null
         } else if (typeof value === 'string') {
-          if (!value.trim()) payload[field.name] = record ? null : undefined
+          if (!value.trim()) payload[field.name] = recordSnapshot ? null : undefined
           else if (field.type === 'number') payload[field.name] = Number(value)
           else if (field.type === 'datetime-local') payload[field.name] = workspaceDateTimeToIso(value)
+          else if (field.type === 'date' && (field.name === 'nextFollowUpAt' || field.name.endsWith('At'))) {
+            payload[field.name] = workspaceDateTimeToIso(`${value}T12:00`)
+          }
           else payload[field.name] = value.trim()
         }
       })
       Object.keys(payload).forEach((key) => { if (payload[key] === undefined) delete payload[key] })
-      await onSave(payload)
-      setStatus(record ? 'Changes saved.' : `${definition.singular} created.`)
+      const saved = await onSave(payload)
+      if (saved && typeof saved === 'object') {
+        const savedRecord = saved as Record<string, unknown>
+        const merged = { ...(recordSnapshot ?? {}), ...savedRecord }
+        setRecordSnapshot(merged)
+        setValues((current) => {
+          const next = { ...current }
+          definition.fields.forEach((field) => {
+            if (field.type === 'picker' || field.type === 'stars' || field.type === 'links' || field.name in savedRecord) {
+              next[field.name] = fieldInitialValue(field, merged)
+            }
+          })
+          return next
+        })
+      }
+      setStatus(recordSnapshot ? 'Changes saved.' : `${definition.singular} created.`)
       onSaved()
     } catch (reason) {
       const apiError = reason instanceof ApiError ? reason : null
@@ -510,16 +1202,21 @@ function RecordEditorForm({ definition, record, inline = false, onSave, onCancel
     } finally { setPending(false) }
   }
 
-  return <form onSubmit={submit} className={`form-body record-editor-form${inline ? ' record-editor-inline' : ''}`}>
-    <div className="record-editor-grid">
+  return <form onSubmit={submit} className={`form-body record-editor-form${inline ? ' record-editor-inline' : ''}${stacked ? ' record-editor-stacked' : ''}`}>
+    <div className={`record-editor-grid${stacked ? ' record-editor-grid-stacked' : ''}`}>
       {definition.fields.map((field) => {
         const value = values[field.name]
-        const className = `form-field${field.wide ? ' field-wide' : ''}`
+        const className = `form-field${field.wide || stacked ? ' field-wide' : ''}`
         const caption = <span>{field.label}{field.required && <b className="required-mark"> *</b>}</span>
         if (field.type === 'picker' || field.options) {
           const selected = Array.isArray(value) ? value as LookupOption[] : []
           const choices = field.options?.map((option) => ({ id: option, label: displayStage(option) }))
-          return <label className={className} key={field.name}>{caption}{field.help && <small className="field-help">{field.help}</small>}<SearchablePicker label={field.label} selected={selected} onChange={(items) => setValue(field.name, items)} source={field.source} options={choices} multiple={field.multiple} allowCustom={field.allowCustom} placeholder={field.placeholder} /></label>
+          // Use a div, not a label — wrapping the combobox in <label> steals clicks from options/chips.
+          return <div className={className} key={field.name}>{caption}{field.help && <small className="field-help">{field.help}</small>}<SearchablePicker label={field.label} selected={selected} onChange={(items) => setValue(field.name, items)} source={field.source} options={choices} multiple={field.multiple} allowCustom={field.allowCustom} placeholder={field.placeholder} /></div>
+        }
+        if (field.type === 'stars') {
+          const rank = typeof value === 'number' ? value : null
+          return <div className={className} key={field.name}><span>{field.label}</span><ImportanceStars value={rank} onChange={(next) => setValue(field.name, next)} size={18} /></div>
         }
         if (field.type === 'links') return <div className={className} key={field.name}><span>{field.label}</span><LinkEditor links={Array.isArray(value) ? value as RecordLink[] : []} onChange={(items) => setValue(field.name, items)} /></div>
         if (field.type === 'date' || field.type === 'datetime-local') return <div className={className} key={field.name}><span>{field.label}{field.required && <b className="required-mark"> *</b>}</span>{field.help && <small className="field-help">{field.help}</small>}<DateQuickInput type={field.type} label={field.label} value={String(value ?? '')} onChange={(next) => setValue(field.name, next)} required={field.required} /></div>
@@ -533,7 +1230,21 @@ function RecordEditorForm({ definition, record, inline = false, onSave, onCancel
   </form>
 }
 
+function useEscapeToClose(onClose: () => void) {
+  useEffect(() => {
+    function handleKey(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', handleKey)
+    return () => window.removeEventListener('keydown', handleKey)
+  }, [onClose])
+}
+
 function RecordFormDialog({ definition, onClose, onSaved, save }: { definition: ResourceFormDefinition; onClose: () => void; onSaved: () => void; save?: (values: Record<string, unknown>) => Promise<unknown> }) {
+  useEscapeToClose(onClose)
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal record-modal" role="dialog" aria-modal="true" aria-labelledby="create-title">
     <div className="modal-header"><div><div className="eyebrow">New record</div><h2 id="create-title">Add {definition.singular.toLowerCase()}</h2><p className="dialog-hint">Capture the details and connect it to the right people and organizations.</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={16} /></button></div>
     <RecordEditorForm definition={definition} onSave={save ?? ((values) => api.create(definition.resource, values))} onCancel={onClose} onSaved={onSaved} />
@@ -547,27 +1258,24 @@ const peopleDefinition: ResourceDefinition<PersonRecord> = {
   fields: [
     { name: 'fullName', label: 'Full name', required: true, placeholder: 'Name as it appears in your workspace' },
     { name: 'jobTitle', label: 'Job title', placeholder: 'e.g. Partnerships lead' },
-    { name: 'importance', label: 'Importance (1–5)', type: 'number', min: 1, max: 5, placeholder: '3' },
+    { name: 'importance', label: 'Importance', type: 'stars', min: 1, max: 5 },
     { name: 'emails', label: 'Email addresses', type: 'picker', multiple: true, allowCustom: true, placeholder: 'Add an email and press Enter' },
     { name: 'phones', label: 'Phone numbers', type: 'picker', multiple: true, allowCustom: true, placeholder: 'Add a phone number and press Enter' },
     { name: 'companyIds', label: 'Companies', type: 'picker', source: 'companies', multiple: true, placeholder: 'Search companies by name' },
     { name: 'introducedByPersonId', label: 'Introduced by', type: 'picker', source: 'people', placeholder: 'Search people by name' },
     { name: 'linkedinUrl', label: 'LinkedIn profile', type: 'url', placeholder: 'https://linkedin.com/in/…' },
     { name: 'links', label: 'Other links', type: 'links', wide: true },
-    { name: 'street', label: 'Street address', placeholder: 'Street and number' },
-    { name: 'city', label: 'City', placeholder: 'Budapest' },
-    { name: 'region', label: 'Region / state', placeholder: 'Pest' },
-    { name: 'postalCode', label: 'Postal code', placeholder: '1051' },
-    { name: 'countryName', label: 'Country', placeholder: 'Hungary' },
-    { name: 'countryCode', label: 'Country code', placeholder: 'HU' },
+    { name: 'city', label: 'City', type: 'picker', source: 'cities', allowCustom: true, placeholder: 'Search cities…' },
     { name: 'categories', label: 'Categories', type: 'picker', source: 'PERSON_CATEGORY', multiple: true, allowCustom: true, placeholder: 'Search or add a category' },
     { name: 'description', label: 'Description', type: 'textarea', wide: true, placeholder: 'Background, interests, and relationship context' },
   ],
   columns: [
     { label: 'Name', render: (person) => <><span className="avatar avatar-small">{getInitials(personName(person))}</span><span className="cell-primary"><strong>{personName(person)}</strong><small>{person.jobTitle ?? 'No title added'}</small></span></> },
+    { label: 'Importance', render: (person) => <ImportanceStars value={person.importance} readOnly size={13} />, className: 'importance-column' },
     { label: 'Email', render: (person) => <span className="cell-muted">{emailOf(person)}</span>, className: 'optional-column' },
     { label: 'Company', render: (person) => <span>{associatedCompanies(person)}</span>, className: 'optional-column' },
-    { label: 'Location', render: (person) => <span>{person.city ?? '—'}</span>, className: 'optional-column' },
+    { label: 'Categories', render: (person) => <TaxonomyBadges values={person.categories} />, className: 'optional-column' },
+    { label: 'City', render: (person) => <span>{person.city ?? '—'}</span>, className: 'optional-column' },
     { label: 'Updated', render: (person) => <span className="mono-caption">{formatDate(person.updatedAt)}</span>, className: 'date-column' },
   ],
 }
@@ -586,18 +1294,13 @@ const companiesDefinition: ResourceDefinition<CompanyRecord> = {
     { name: 'customerProfile', label: 'Customer profile', type: 'textarea', placeholder: 'Who does the company serve?' },
     { name: 'businessRole', label: 'Business role', placeholder: 'e.g. Customer, partner, supplier' },
     { name: 'ownerUserId', label: 'Owner', type: 'picker', source: 'users', placeholder: 'Search workspace members by name' },
-    { name: 'street', label: 'Street address', placeholder: 'Street and number' },
-    { name: 'city', label: 'City', placeholder: 'Budapest' },
-    { name: 'region', label: 'Region / state', placeholder: 'Pest' },
-    { name: 'postalCode', label: 'Postal code', placeholder: '1051' },
-    { name: 'countryName', label: 'Country', placeholder: 'Hungary' },
-    { name: 'countryCode', label: 'Country code', placeholder: 'HU' },
+    { name: 'city', label: 'City', type: 'picker', source: 'cities', allowCustom: true, placeholder: 'Search cities…' },
     { name: 'description', label: 'Description', type: 'textarea', wide: true, placeholder: 'What does this company do?' },
   ],
   columns: [
     { label: 'Company', render: (company) => <><span className="avatar avatar-small company-avatar"><Building2 size={15} /></span><span className="cell-primary"><strong>{company.name}</strong><small>{company.domain ?? company.website ?? 'No website added'}</small></span></> },
-    { label: 'Industry', render: (company) => <span>{company.industries?.join(', ') ?? company.categories?.join(', ') ?? '—'}</span>, className: 'optional-column' },
-    { label: 'Location', render: (company) => <span>{company.city ?? '—'}</span>, className: 'optional-column' },
+    { label: 'Industry', render: (company) => <span>{taxonomyLabels(company.industries) !== '—' ? taxonomyLabels(company.industries) : taxonomyLabels(company.categories)}</span>, className: 'optional-column' },
+    { label: 'City', render: (company) => <span>{company.city ?? '—'}</span>, className: 'optional-column' },
     { label: 'People', render: (company) => <span className="mono-caption">{company.peopleCount ?? '—'}</span>, className: 'date-column' },
     { label: 'Updated', render: (company) => <span className="mono-caption">{formatDate(company.updatedAt)}</span>, className: 'date-column' },
   ],
@@ -825,7 +1528,7 @@ function FollowUpsPage() {
   return <section className="page-stack">
     <div className="page-heading"><div><div className="eyebrow page-eyebrow">WORKSPACE / ACTIONS</div><h1>Follow-ups</h1><p>Make the next relationship-building action clear, assigned, and easy to close out.</p></div><button type="button" className="button button-primary" onClick={() => setCreateOpen(true)}><Plus size={16} />Add follow-up</button></div>
     {actionError && <div className="form-error" role="alert">{actionError}</div>}
-    <div className="workflow-summary"><span className="workflow-summary-icon"><ListChecks size={16} /></span><span><strong>{openCount}</strong> open action{openCount === 1 ? '' : 's'} need attention</span></div>
+    <div className="workflow-summary"><span className="workflow-summary-icon"><ListChecks size={16} /></span><span><strong>{openCount}</strong> open action{openCount === 1 ? '' : 's'} {openCount === 1 ? 'needs' : 'need'} attention</span></div>
     <WorkflowListPanel title="Follow-ups" icon={ListChecks} count={records.length} loading={loading} error={error} onRetry={reload} emptyTitle="You’re all caught up" emptyDescription="Create a follow-up to make sure an important next step does not get lost." emptyAction={<button type="button" className="button button-primary" onClick={() => setCreateOpen(true)}><Plus size={15} />Add follow-up</button>}>
       {records.map((record) => {
         const dueAt = record.dueAt
@@ -951,17 +1654,30 @@ function IntroductionsPage() {
   </section>
 }
 
-function MeetingNoteActionDialog({ record, mode, onClose, onSaved }: { record: MeetingNoteRequirementRecord; mode: 'complete' | 'cancel'; onClose: () => void; onSaved: () => void }) {
+function MeetingNoteActionDialog({ record, mode, onClose, onSaved }: {
+  record: MeetingNoteRequirementRecord
+  mode: 'view' | 'edit' | 'complete' | 'cancel'
+  onClose: () => void
+  onSaved: () => void
+}) {
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const readOnly = mode === 'view'
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (readOnly) return
     setError(null)
     const form = new FormData(event.currentTarget)
     setPending(true)
     try {
       if (mode === 'complete') {
         await api.completeMeetingNote(record.id, {
+          summary: String(form.get('summary') ?? '').trim(),
+          nextStepsMarkdown: String(form.get('nextStepsMarkdown') ?? '').trim() || undefined,
+          followUpDate: String(form.get('followUpDate') ?? '').trim() || undefined,
+        })
+      } else if (mode === 'edit') {
+        await api.updateMeetingNote(record.id, {
           summary: String(form.get('summary') ?? '').trim(),
           nextStepsMarkdown: String(form.get('nextStepsMarkdown') ?? '').trim() || undefined,
           followUpDate: String(form.get('followUpDate') ?? '').trim() || undefined,
@@ -977,33 +1693,65 @@ function MeetingNoteActionDialog({ record, mode, onClose, onSaved }: { record: M
     }
   }
   const title = record.eventTitle ?? record.title ?? 'Meeting note'
+  const eyebrow = mode === 'complete' ? 'MEETING RECAP' : mode === 'edit' ? 'EDIT NOTE' : mode === 'view' ? 'MEETING NOTE' : 'CANCEL REQUIREMENT'
+  const heading = mode === 'complete' ? 'Complete meeting note' : mode === 'edit' ? 'Edit meeting note' : mode === 'view' ? 'Meeting note' : 'Cancel meeting note'
+  const noteFields = <>
+    <label className="form-field"><span>Meeting summary{!readOnly && <b className="required-mark"> *</b>}</span>
+      <textarea name="summary" rows={5} required={!readOnly} readOnly={readOnly} defaultValue={record.summary ?? ''} placeholder="What was discussed?" />
+    </label>
+    <label className="form-field"><span>Next steps</span>
+      <textarea name="nextStepsMarkdown" rows={3} readOnly={readOnly} defaultValue={record.nextStepsMarkdown ?? ''} placeholder="Actions, owners, and decisions" />
+    </label>
+    <div className="form-field"><span>Follow-up date</span>
+      {readOnly
+        ? <input type="text" readOnly value={record.followUpDate ? formatDate(record.followUpDate) : '—'} />
+        : <DateQuickInput name="followUpDate" label="Follow-up date" defaultValue={record.followUpDate?.slice(0, 10) ?? ''} />}
+    </div>
+  </>
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="meeting-note-action-title">
-    <div className="modal-header"><div><div className="eyebrow">{mode === 'complete' ? 'MEETING RECAP' : 'CANCEL REQUIREMENT'}</div><h2 id="meeting-note-action-title">{mode === 'complete' ? 'Complete meeting note' : 'Cancel meeting note'}</h2><p className="dialog-hint">{title}</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={16} /></button></div>
+    <div className="modal-header"><div><div className="eyebrow">{eyebrow}</div><h2 id="meeting-note-action-title">{heading}</h2><p className="dialog-hint">{title}</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={16} /></button></div>
     <form className="form-body" onSubmit={submit}>
-      {mode === 'complete' ? <><label className="form-field"><span>Meeting summary <b className="required-mark"> *</b></span><textarea name="summary" rows={4} required defaultValue={record.summary ?? ''} placeholder="What was discussed?" /></label><label className="form-field"><span>Next steps</span><textarea name="nextStepsMarkdown" rows={3} defaultValue={record.nextStepsMarkdown ?? ''} placeholder="Actions, owners, and decisions" /></label><div className="form-field"><span>Follow-up date</span><DateQuickInput name="followUpDate" label="Follow-up date" defaultValue={record.followUpDate?.slice(0, 10) ?? ''} /></div></> : <label className="form-field"><span>Cancellation reason <b className="required-mark"> *</b></span><textarea name="reason" rows={3} required placeholder="Why is this note no longer required?" /></label>}
+      {mode === 'cancel'
+        ? <label className="form-field"><span>Cancellation reason <b className="required-mark"> *</b></span><textarea name="reason" rows={3} required placeholder="Why is this note no longer required?" /></label>
+        : noteFields}
       {error && <div className="form-error" role="alert">{error}</div>}
-      <div className="modal-actions"><button type="button" className="button button-ghost" onClick={onClose} disabled={pending}>Keep open</button><button type="submit" className={`button ${mode === 'complete' ? 'button-primary' : 'button-ghost danger-action'}`} disabled={pending}>{pending ? <LoaderCircle size={15} className="spin" /> : mode === 'complete' ? <Check size={15} /> : null}{mode === 'complete' ? 'Complete note' : 'Cancel requirement'}</button></div>
+      <div className="modal-actions">
+        <button type="button" className="button button-ghost" onClick={onClose} disabled={pending}>{readOnly ? 'Close' : mode === 'cancel' ? 'Keep open' : 'Discard'}</button>
+        {!readOnly && <button type="submit" className={`button ${mode === 'cancel' ? 'button-ghost danger-action' : 'button-primary'}`} disabled={pending}>{pending ? <LoaderCircle size={15} className="spin" /> : mode === 'complete' || mode === 'edit' ? <Check size={15} /> : null}{mode === 'complete' ? 'Complete note' : mode === 'edit' ? 'Save changes' : 'Cancel requirement'}</button>}
+      </div>
     </form>
   </section></div>
 }
 
 function MeetingNotesPage() {
   const { records, loading, error, reload } = useWorkflowResource<MeetingNoteRequirementRecord>(api.listMeetingNotes)
-  const [action, setAction] = useState<{ record: MeetingNoteRequirementRecord; mode: 'complete' | 'cancel' } | null>(null)
+  const [action, setAction] = useState<{ record: MeetingNoteRequirementRecord; mode: 'view' | 'edit' | 'complete' | 'cancel' } | null>(null)
   const outstanding = records.filter((record) => !['COMPLETED', 'CANCELLED'].includes((record.status ?? 'REQUIRED').toUpperCase())).length
   return <section className="page-stack">
-    <div className="page-heading"><div><div className="eyebrow page-eyebrow">WORKSPACE / MEETING WORKFLOW</div><h1>Meeting-note requirements</h1><p>Required recaps for eligible meetings. Complete the summary and next steps, or record why a note is no longer needed.</p></div></div>
+    <div className="page-heading"><div><div className="eyebrow page-eyebrow">WORKSPACE / MEETING WORKFLOW</div><h1>Meeting notes</h1><p>Recaps for eligible meetings. Write the note, mark it complete, or reopen it later to edit.</p></div></div>
     <div className="workflow-summary"><span className="workflow-summary-icon"><ClipboardCheck size={16} /></span><span><strong>{outstanding}</strong> note{outstanding === 1 ? '' : 's'} still required</span></div>
     <WorkflowListPanel title="Meeting notes" icon={ClipboardCheck} count={records.length} loading={loading} error={error} onRetry={reload} emptyTitle="No meeting notes required" emptyDescription="Required notes appear here after eligible meetings. Calendar exclusions prevent unnecessary reminders.">
       {records.map((record) => {
-        const status = record.status ?? 'REQUIRED'
-        const actionable = !['COMPLETED', 'CANCELLED'].includes(status.toUpperCase())
+        const status = (record.status ?? 'REQUIRED').toUpperCase()
+        const required = status === 'REQUIRED'
+        const completed = status === 'COMPLETED'
+        const cancelled = status === 'CANCELLED'
+        const eyebrow = required ? 'REQUIRED RECAP' : completed ? 'MEETING RECAP' : 'CANCELLED RECAP'
         return <article className="workflow-card" key={record.id}>
-          <div className="workflow-card-heading"><div><span className="eyebrow">REQUIRED RECAP</span><h3>{record.eventTitle ?? record.title ?? 'Meeting note'}</h3></div><span className={`workflow-status ${statusClass(status)}`}>{statusText(status)}</span></div>
-          <div className="workflow-card-meta"><span><Clock3 size={13} />{formatDateTime(record.meetingAt ?? record.createdAt)}</span>{record.eventId && <span>Event {record.eventId}</span>}</div>
-          {record.summary && <p className="workflow-description">{record.summary}</p>}
+          <div className="workflow-card-heading"><div><span className="eyebrow">{eyebrow}</span><h3>{record.eventTitle ?? record.title ?? 'Meeting note'}</h3></div><span className={`workflow-status ${statusClass(status)}`}>{statusText(status)}</span></div>
+          <div className="workflow-card-meta"><span><Clock3 size={13} />{formatDateTime(record.meetingAt ?? record.createdAt)}</span>{record.followUpDate && <span>Follow-up {formatDate(record.followUpDate)}</span>}</div>
+          {record.summary
+            ? <div className="workflow-note-body"><span className="eyebrow">Note</span><p className="workflow-description">{record.summary}</p></div>
+            : required && <p className="workflow-note">No note written yet.</p>}
+          {record.nextStepsMarkdown && <div className="workflow-note-body"><span className="eyebrow">Next steps</span><p className="workflow-description">{record.nextStepsMarkdown}</p></div>}
           {record.cancellationReason && <p className="workflow-note">Cancelled: {record.cancellationReason}</p>}
-          {actionable && <div className="workflow-card-actions"><button type="button" className="button button-primary button-small" onClick={() => setAction({ record, mode: 'complete' })}><Check size={13} />Complete note</button><button type="button" className="button button-ghost button-small danger-action" onClick={() => setAction({ record, mode: 'cancel' })}>Cancel requirement</button></div>}
+          <div className="workflow-card-actions">
+            {(completed || (record.summary && !required)) && <button type="button" className="button button-ghost button-small" onClick={() => setAction({ record, mode: 'view' })}><FileText size={13} />View note</button>}
+            {(required || completed) && <button type="button" className="button button-ghost button-small" onClick={() => setAction({ record, mode: required ? 'complete' : 'edit' })}>{required ? <Check size={13} /> : <Pencil size={13} />}{required ? 'Write / complete' : 'Edit note'}</button>}
+            {required && <button type="button" className="button button-ghost button-small danger-action" onClick={() => setAction({ record, mode: 'cancel' })}>Cancel requirement</button>}
+            <Link to={`/notes?id=${encodeURIComponent(record.id)}`} className="button button-ghost button-small">Open in Notes<ArrowUpRight size={13} /></Link>
+            {cancelled && !record.summary && <button type="button" className="button button-ghost button-small" onClick={() => setAction({ record, mode: 'view' })}><FileText size={13} />Details</button>}
+          </div>
         </article>
       })}
     </WorkflowListPanel>
@@ -1018,9 +1766,9 @@ const navItems = [
   { to: '/opportunities', label: 'Opportunities', icon: BriefcaseBusiness },
   { to: '/events', label: 'Events', icon: CalendarDays },
   { to: '/follow-ups', label: 'Follow-ups', icon: ListChecks },
-  { to: '/introductions', label: 'Warm introductions', icon: GitBranch },
-  { to: '/meeting-notes', label: 'Meeting-note requirements', icon: ClipboardCheck },
-  { to: '/notes', label: 'Notes & meetings', icon: FileText },
+  { to: '/introductions', label: 'Warm intros', icon: GitBranch },
+  { to: '/meeting-notes', label: 'Meeting notes', icon: ClipboardCheck },
+  { to: '/notes', label: 'Notes', icon: FileText },
 ]
 
 function BrandLogo({ className = '' }: { className?: string }) {
@@ -1404,9 +2152,9 @@ export default function App() {
     {mobileNav && <button aria-label="Close navigation" className="mobile-scrim" onClick={() => setMobileNav(false)} />}
     <aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}>
       <div className="brand-row"><BrandLogo /><span className="brand-product-label">CRM</span><button className="icon-button sidebar-close" aria-label="Close navigation" onClick={() => setMobileNav(false)}><X size={16} /></button></div>
-      <div className="workspace-switcher"><span className="workspace-monogram">R</span><span><strong>Resoloon</strong><small>Shared workspace</small></span><ChevronDown size={14} /></div>
+      <div className="workspace-switcher" aria-label="Current workspace"><span className="workspace-monogram">R</span><span><strong>Resoloon</strong><small>Shared workspace</small></span></div>
       <div className="nav-section-label">WORKSPACE</div>
-      <nav className="primary-nav" aria-label="Main navigation">{navItems.map(({ to, label, icon: Icon, end }) => <NavLink key={to} to={to} end={end} className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}><Icon size={16} /><span>{label}</span>{label === 'Opportunities' && <span className="nav-arrow">↗</span>}</NavLink>)}{isAdmin && <NavLink to="/admin/users" className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}><ShieldCheck size={16} /><span>User management</span></NavLink>}</nav>
+      <nav className="primary-nav" aria-label="Main navigation">{navItems.map(({ to, label, icon: Icon, end }) => <NavLink key={to} to={to} end={end} className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}><Icon size={16} /><span>{label}</span></NavLink>)}{isAdmin && <NavLink to="/settings/categories" className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}><Settings size={16} /><span>Categories</span></NavLink>}{isAdmin && <NavLink to="/admin/users" className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}><ShieldCheck size={16} /><span>User management</span></NavLink>}</nav>
       <div className="sidebar-bottom"><div className="workspace-status"><span className="status-dot" /><span>Workspace connected</span></div><a className="sidebar-foot-link" href="mailto:support@resoloon.com"><CircleHelp size={14} />Help & feedback</a><div className="sidebar-version">RESOLOON CRM <span>·</span> PRIVATE WORKSPACE</div></div>
     </aside>
 
@@ -1427,6 +2175,7 @@ export default function App() {
         <Route path="/introductions" element={<IntroductionsPage />} />
         <Route path="/meeting-notes" element={<MeetingNotesPage />} />
         <Route path="/notes" element={<ResourcePage definition={notesDefinition} />} />
+        <Route path="/settings/categories" element={isAdmin ? <SettingsCategoriesPage /> : <AccessDeniedPage />} />
         <Route path="/admin/users" element={isAdmin ? <AdminUsersPage currentUserId={typeof (identity as UserIdentity & { id?: string }).id === 'string' ? (identity as UserIdentity & { id?: string }).id : undefined} /> : <AccessDeniedPage />} />
         <Route path="/search" element={<FullSearchPage />} />
         <Route path="/:resource/:id" element={<RecordDetailPage />} />
@@ -1454,12 +2203,19 @@ function DashboardPage() {
 
   const summary = dashboard?.summary ?? dashboard?.metrics ?? {}
   return <section className="page-stack dashboard-page">
-    <div className="page-heading dashboard-heading"><div><div className="eyebrow page-eyebrow">THURSDAY, {new Intl.DateTimeFormat(undefined, { month: 'long', day: 'numeric', year: 'numeric' }).format(new Date()).toUpperCase()}</div><h1>Good work starts<br className="mobile-break" /> with good relationships.</h1><p>Your shared workspace, at a glance.</p></div><Link to="/people" className="button button-ghost"><UsersRound size={15} />Browse people</Link></div>
+    <div className="page-heading dashboard-heading"><div><div className="eyebrow page-eyebrow">{new Intl.DateTimeFormat(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }).format(new Date()).toUpperCase()}</div><h1>Good work starts<br className="mobile-break" /> with good relationships.</h1><p>Your shared workspace, at a glance.</p></div><Link to="/people" className="button button-ghost"><UsersRound size={15} />Browse people</Link></div>
     {error ? <ErrorState message={error} onRetry={reload} /> : <>
       <div className="section-heading"><div><span className="eyebrow">YOUR WORKSPACE</span><h2>Overview</h2></div>{loading && <span className="subtle-loading"><LoaderCircle className="spin" size={13} />Updating</span>}</div>
-      <div className="metrics-grid"><MetricCard label="People" value={summary.people ?? '—'} detail="In your network" icon={UsersRound} tone="positive" /><MetricCard label="Companies" value={summary.companies ?? '—'} detail="Across your workspace" icon={Building2} /><MetricCard label="Opportunities" value={summary.opportunities ?? '—'} detail="In your pipeline" icon={BriefcaseBusiness} /><MetricCard label="Open follow-ups" value={summary.openFollowUps ?? '—'} detail="Ready for your attention" icon={Clock3} /></div>
-      <div className="dashboard-columns"><section className="dashboard-panel"><div className="panel-heading"><div><span className="eyebrow">NEXT UP</span><h2>Action items</h2></div><span className="panel-count">{dashboard?.actionItems?.length ?? 0}</span></div>{loading ? <LoadingState label="Loading action items…" /> : dashboard?.actionItems?.length ? <div className="action-list">{dashboard.actionItems.map((item) => <Link className="action-row" key={item.id} to={item.href ?? '/opportunities'}><span className="action-check"><Check size={12} /></span><span className="action-copy"><strong>{item.title}</strong><small>{item.description ?? item.status ?? 'Open action'}</small></span><span className="action-date">{formatDate(item.dueAt)}</span><ArrowUpRight size={14} className="row-arrow" /></Link>)}</div> : <EmptyState icon={Check} title="Nothing needs your attention" description="Follow-ups and other priority actions will appear here." />}</section>
-        <section className="dashboard-panel"><div className="panel-heading"><div><span className="eyebrow">TEAM ACTIVITY</span><h2>Recently updated</h2></div><Clock3 size={15} className="muted-icon" /></div>{loading ? <LoadingState label="Loading recent activity…" /> : dashboard?.recentActivity?.length ? <div className="activity-list">{dashboard.recentActivity.map((activity) => <article className="activity-row" key={activity.id}><span className="activity-marker" /><div><strong>{activity.title}</strong><p>{activity.description ?? activity.actorName ?? 'Workspace update'}</p><small>{formatDate(activity.occurredAt)}</small></div></article>)}</div> : <EmptyState icon={Clock3} title="Your story starts here" description="Changes to shared records will show up in this activity feed." />}</section></div>
+      <div className="metrics-grid"><MetricCard label="People" value={summary.people ?? '—'} detail="In your network" icon={UsersRound} tone="positive" to="/people" /><MetricCard label="Companies" value={summary.companies ?? '—'} detail="Across your workspace" icon={Building2} to="/companies" /><MetricCard label="Opportunities" value={summary.opportunities ?? '—'} detail="In your pipeline" icon={BriefcaseBusiness} to="/opportunities" /><MetricCard label="Open follow-ups" value={summary.openFollowUps ?? '—'} detail="Ready for your attention" icon={Clock3} to="/follow-ups" /></div>
+      <div className="dashboard-columns"><section className="dashboard-panel"><div className="panel-heading"><div><span className="eyebrow">NEXT UP</span><h2>Action items</h2></div><span className="panel-count">{dashboard?.actionItems?.length ?? 0}</span></div>{loading ? <LoadingState label="Loading action items…" /> : dashboard?.actionItems?.length ? <div className="action-list">{dashboard.actionItems.map((item) => <Link className="action-row" key={item.id} to={item.href ?? '/follow-ups'}><span className="action-check"><Check size={12} /></span><span className="action-copy"><strong>{item.title}</strong><small>{item.description ?? item.status ?? 'Open action'}</small></span><span className="action-date">{formatDate(item.dueAt)}</span><ArrowUpRight size={14} className="row-arrow" /></Link>)}</div> : <EmptyState icon={Check} title="Nothing needs your attention" description="Follow-ups and other priority actions will appear here." />}</section>
+        <section className="dashboard-panel"><div className="panel-heading"><div><span className="eyebrow">TEAM ACTIVITY</span><h2>Recently updated</h2></div><Clock3 size={15} className="muted-icon" /></div>{loading ? <LoadingState label="Loading recent activity…" /> : dashboard?.recentActivity?.length ? <div className="activity-list">{dashboard.recentActivity.map((activity) => {
+          const copy = humanizeActivity(String(activity.title ?? ''), activity.recordName, activity.actorName)
+          const href = activity.recordType && activity.recordId ? recordPath(activity.recordType, activity.recordId) : null
+          const body = <><span className="activity-marker" /><div><strong>{copy.title}</strong><p>{copy.detail}</p><small>{formatDate(activity.occurredAt)}</small></div></>
+          return href
+            ? <Link className="activity-row activity-row-link" key={activity.id} to={href}>{body}</Link>
+            : <article className="activity-row" key={activity.id}>{body}</article>
+        })}</div> : <EmptyState icon={Clock3} title="Your story starts here" description="Changes to shared records will show up in this activity feed." />}</section></div>
       <section className="quick-links"><div className="quick-links-copy"><span className="eyebrow">MAKE A CONNECTION</span><h2>Keep your network in motion.</h2><p>People, organizations, and opportunities—connected in one shared place.</p></div><div className="quick-link-buttons"><Link to="/companies" className="button button-ghost"><Building2 size={15} />Companies<ArrowUpRight size={13} /></Link><Link to="/opportunities" className="button button-ghost"><BriefcaseBusiness size={15} />Opportunities<ArrowUpRight size={13} /></Link><Link to="/notes" className="button button-ghost"><FileText size={15} />Notes<ArrowUpRight size={13} /></Link></div></section>
     </>}
   </section>
@@ -1477,7 +2233,7 @@ function FullSearchPage() {
     let active = true
     if (!query) { setResults([]); setLoading(false); return }
     setLoading(true)
-    api.search(query).then((items) => { if (active) { setResults(items); setError(null) } }).catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : 'Search is unavailable.') }).finally(() => { if (active) setLoading(false) })
+    api.search(query, 40).then((items) => { if (active) { setResults(items); setError(null) } }).catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : 'Search is unavailable.') }).finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [query, retryToken])
 
@@ -1486,35 +2242,18 @@ function FullSearchPage() {
 
 function RecordDetailPage() {
   const { resource = '', id = '' } = useParams()
-  const [record, setRecord] = useState<Record<string, unknown> | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [token, setToken] = useState(0)
   const navigate = useNavigate()
   const safeResource = ['people', 'companies', 'opportunities', 'notes'].includes(resource) ? resource : null
 
   useEffect(() => {
-    let active = true
-    if (!safeResource) { setLoading(false); setError('This record type is not available.'); return }
-    setLoading(true)
-    api.get<Record<string, unknown>>(safeResource, id).then((data) => { if (active) { setRecord(data); setError(null) } }).catch((reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : 'Unable to load this record.') }).finally(() => { if (active) setLoading(false) })
-    return () => { active = false }
-  }, [id, safeResource, token])
+    if (!safeResource || !id) {
+      navigate('/', { replace: true })
+      return
+    }
+    navigate(`/${safeResource}?id=${encodeURIComponent(id)}`, { replace: true })
+  }, [id, navigate, safeResource])
 
-  const pageTitle = safeResource === 'people' ? 'People' : safeResource === 'companies' ? 'Companies' : safeResource === 'opportunities' ? 'Opportunities' : 'Notes & meetings'
-  const formDefinition: ResourceFormDefinition | null = safeResource === 'people' ? peopleDefinition : safeResource === 'companies' ? companiesDefinition : safeResource === 'opportunities' ? opportunityDefinition : safeResource === 'notes' ? notesDefinition : null
-  return <section className="page-stack">
-    <button type="button" className="back-link" onClick={() => navigate(safeResource ? `/${safeResource}` : '/')}><ArrowLeft size={14} />Back to {pageTitle.toLowerCase()}</button>
-    {loading ? <LoadingState label="Loading record…" /> : error ? <ErrorState message={error} onRetry={() => setToken((value) => value + 1)} /> : record ? <div className="detail-panel">
-      <div className="detail-heading"><div><div className="eyebrow">{pageTitle.toUpperCase()} / EDITING</div><h1>{String(record.fullName ?? record.name ?? record.title ?? 'Record')}</h1><p className="detail-subtitle">Changes save directly to this record. Related records are searchable by name.</p></div><div className="detail-actions">{record.stage != null && <StagePill stage={String(record.stage)} />}</div></div>
-      {formDefinition && <RecordEditorForm key={`${id}-${token}`} definition={formDefinition} record={record} inline onSave={async (values) => {
-        const updated = await api.update<Record<string, unknown>>(safeResource!, id, values)
-        setRecord(updated)
-        return updated
-      }} onSaved={() => {}} onReload={() => setToken((value) => value + 1)} />}
-      {Array.isArray(record.introductionObligations) && record.introductionObligations.length > 0 && <section className="detail-description introduction-obligations"><span className="eyebrow">YOUR INTRODUCTION OBLIGATIONS</span>{(record.introductionObligations as Array<Record<string, unknown>>).map((obligation, index) => <p key={`${String(obligation.chainId ?? index)}-${String(obligation.position ?? index)}`}>Introduce <strong>{String(obligation.targetPersonName ?? 'the next person')}</strong>{obligation.followUpAt ? ` · follow up ${formatDate(String(obligation.followUpAt))}` : ''}{obligation.notes ? ` · ${String(obligation.notes)}` : ''}</p>)}<Link to="/introductions" className="one-time-link-open">Open introduction chains</Link></section>}
-    </div> : null}
-  </section>
+  return <LoadingState label="Opening record…" />
 }
 
 function NotFoundPage() {

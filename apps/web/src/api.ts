@@ -183,12 +183,22 @@ export const api = {
     request<unknown>('/meeting-notes', { method: 'POST', body: JSON.stringify(body) }, true).then(unwrapObject<MeetingNoteRequirementRecord>),
   completeMeetingNote: (id: string, body: { summary: string; nextStepsMarkdown?: string; followUpDate?: string }) =>
     request<unknown>(`/meeting-notes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ ...body, status: 'COMPLETED' }) }, true).then((payload) => { announceUndo(payload); return unwrapObject<MeetingNoteRequirementRecord>(payload) }),
+  updateMeetingNote: (id: string, body: { summary: string; nextStepsMarkdown?: string; followUpDate?: string; title?: string }) =>
+    request<unknown>(`/meeting-notes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }, true).then(unwrapObject<MeetingNoteRequirementRecord>),
   cancelMeetingNote: (id: string, reason: string) =>
     request<unknown>(`/meeting-notes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ status: 'CANCELLED', cancellationReason: reason }) }, true).then((payload) => { announceUndo(payload); return unwrapObject<MeetingNoteRequirementRecord>(payload) }),
   undo: (token: string) => request<{ undone: boolean; actionType: string; targetId: string }>(`/undo/${encodeURIComponent(token)}`, { method: 'POST', body: JSON.stringify({}) }, true),
   dashboard: async () => unwrapObject<DashboardData>(await request<unknown>('/dashboard')),
-  search: async (query: string) => {
-    const params = new URLSearchParams({ q: query, limit: '8' })
+  searchCities: async (query: string, limit = 8) => {
+    const params = new URLSearchParams({
+      q: query.trim(),
+      limit: String(Math.min(Math.max(limit, 1), 20)),
+    })
+    const payload = await request<unknown>(`/locations/cities?${params.toString()}`)
+    return unwrapList<{ id: string; label: string; subtitle?: string }>(payload)
+  },
+  search: async (query: string, limit = 8) => {
+    const params = new URLSearchParams({ q: query, limit: String(Math.min(Math.max(limit, 1), 50)) })
     const payload = await request<unknown>(`/search?${params.toString()}`)
     const unwrapped = payload && typeof payload === 'object' && 'data' in payload
       ? (payload as { data: unknown }).data
@@ -229,5 +239,5 @@ export function recordPath(type: string | undefined, id: string): string {
       : normalized.includes('opportun') ? 'opportunities'
         : normalized.includes('note') ? 'notes'
           : 'search'
-  return route === 'search' ? `/search?q=${encodeURIComponent(id)}` : `/${route}/${id}`
+  return route === 'search' ? `/search?q=${encodeURIComponent(id)}` : `/${route}?id=${encodeURIComponent(id)}`
 }

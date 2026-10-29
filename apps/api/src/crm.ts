@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { Pool, PoolClient } from 'pg'
 import { requireAuth, type AuthUser } from './auth.js'
+import { searchProviderCities, type CitySuggestion } from './geocoder.js'
 
 type CrmOptions = { pool: Pool }
 type AuthenticatedRequest = FastifyRequest & { authUser: AuthUser }
@@ -155,7 +156,16 @@ function isoDate(value: unknown, field: string, nullable = false): string | null
 
 function isoTimestamp(value: unknown, field: string, nullable = false): string | null {
   if (value === null && nullable) return null
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T/.test(value) || Number.isNaN(Date.parse(value))) {
+  if (typeof value !== 'string') throw new HttpError(400, `${field} must be an ISO 8601 timestamp${nullable ? ' or null' : ''}.`)
+  // Accept calendar dates from date inputs and normalize to noon UTC.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const parsed = new Date(`${value}T12:00:00.000Z`)
+    if (Number.isNaN(parsed.valueOf()) || parsed.toISOString().slice(0, 10) !== value) {
+      throw new HttpError(400, `${field} must be a valid calendar date or ISO 8601 timestamp.`)
+    }
+    return parsed.toISOString()
+  }
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(value) || Number.isNaN(Date.parse(value))) {
     throw new HttpError(400, `${field} must be an ISO 8601 timestamp${nullable ? ' or null' : ''}.`)
   }
   return new Date(value).toISOString()
@@ -253,10 +263,20 @@ function phoneArray(body: JsonObject): { supplied: boolean; values: Array<{ raw:
 }
 
 function urlArray(body: JsonObject, key: string): { supplied: boolean; values: Array<{ raw: string; canonical: string }> } {
-  const parsed = stringArray(body, key, key, 100, 2_000)
-  const values = parsed.values.map((value) => canonicalWebsite(value) as { raw: string; canonical: string })
+  if (!has(body, key)) return { supplied: false, values: [] }
+  const raw = body[key]
+  if (raw === null) return { supplied: true, values: [] }
+  if (!Array.isArray(raw) || raw.length > 100) throw new HttpError(400, `${key} must be an array of at most 100 URLs or null.`)
+  const values = raw.map((item, index) => {
+    if (typeof item === 'string') return canonicalWebsite(item) as { raw: string; canonical: string }
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      const url = (item as JsonObject).url ?? (item as JsonObject).rawUrl
+      return canonicalWebsite(url) as { raw: string; canonical: string }
+    }
+    throw new HttpError(400, `${key}[${index}] must be a URL string or { url } object.`)
+  })
   if (new Set(values.map((value) => value.canonical)).size !== values.length) throw new HttpError(400, `${key} must not contain duplicate URLs.`)
-  return { supplied: parsed.supplied, values }
+  return { supplied: true, values }
 }
 
 function domainArray(body: JsonObject): { supplied: boolean; values: Array<{ raw: string; normalized: string }> } {
@@ -282,21 +302,8 @@ function taxonomyLabels(body: JsonObject, key: string): { supplied: boolean; val
   return parsed
 }
 
-function addressValue(body: JsonObject, key: 'street' | 'city' | 'region' | 'postalCode' | 'countryName' | 'countryCode'): string | null {
-  const labels = { street: 'street', city: 'city', region: 'region', postalCode: 'postalCode', countryName: 'countryName', countryCode: 'countryCode' }
-  const value = optionalText(body, key, labels[key], key === 'street' ? 1_000 : 300)
-  if (key !== 'countryCode' || value === null) return value
-  const code = value.toUpperCase()
-  if (!/^[A-Z]{2}$/.test(code)) throw new HttpError(400, 'countryCode must be a two-letter ISO country code or null.')
-  return code
-}
-
-function addressFields(body: JsonObject): Array<{ key: 'street' | 'city' | 'region' | 'postalCode' | 'countryName' | 'countryCode'; column: string; value: string | null }> {
-  const fields = [
-    ['street', 'street'], ['city', 'city'], ['region', 'region'], ['postalCode', 'postal_code'],
-    ['countryName', 'country_name'], ['countryCode', 'country_code'],
-  ] as const
-  return fields.filter(([key]) => has(body, key)).map(([key, column]) => ({ key, column, value: addressValue(body, key) }))
+function addressValue(body: JsonObject, key: 'city'): string | null {
+  return optionalText(body, key, 'city', 300)
 }
 
 function taxonomyValues(body: JsonObject, key: string, expectedTaxonomy: 'PERSON_CATEGORY' | 'COMPANY_CATEGORY' | 'INDUSTRY') {
@@ -616,37 +623,6 @@ async function setPrimaryAddressCity(
   }
 }
 
-async function setPrimaryAddress(
-  client: PoolClient,
-  table: 'person_addresses' | 'company_addresses',
-  ownerColumn: 'person_id' | 'company_id',
-  workspaceId: string,
-  ownerId: string,
-  fields: Array<{ column: string; value: string | null }>,
-) {
-  if (!fields.length) return
-  const current = await client.query(
-    `SELECT id FROM ${table} WHERE workspace_id = $1 AND ${ownerColumn} = $2 AND is_primary FOR UPDATE`,
-    [workspaceId, ownerId],
-  )
-  if (current.rowCount) {
-    const assignments = fields.map(({ column }, index) => `${column} = $${index + 3}`).join(', ')
-    await client.query(
-      `UPDATE ${table} SET ${assignments} WHERE workspace_id = $1 AND id = $2`,
-      [workspaceId, current.rows[0].id, ...fields.map(({ value }) => value)],
-    )
-    return
-  }
-  const valuesByColumn = new Map(fields.map(({ column, value }) => [column, value]))
-  if (![...valuesByColumn.values()].some((value) => value !== null)) return
-  const columns = [...valuesByColumn.keys()]
-  await client.query(
-    `INSERT INTO ${table} (workspace_id, ${ownerColumn}, ${columns.join(', ')}, is_primary)
-     VALUES ($1, $2, ${columns.map((_, index) => `$${index + 3}`).join(', ')}, true)`,
-    [workspaceId, ownerId, ...columns.map((column) => valuesByColumn.get(column))],
-  )
-}
-
 async function replacePersonEmails(client: PoolClient, workspaceId: string, personId: string, emails: Array<{ raw: string; normalized: string }>) {
   for (const email of emails) await duplicateEmail(client, workspaceId, email.normalized, personId)
   await client.query('DELETE FROM person_emails WHERE workspace_id = $1 AND person_id = $2', [workspaceId, personId])
@@ -817,13 +793,20 @@ const PERSON_SELECT = `
                       WHERE rt.workspace_id = p.workspace_id AND rt.record_id = p.id AND t.taxonomy = 'PERSON_CATEGORY'), '[]'::jsonb) AS categories
           ,COALESCE((SELECT jsonb_agg(jsonb_build_object(
                          'chainId', ic.id, 'targetPersonId', target.id, 'targetPersonName', target.full_name,
+                         'introduceToPersonId', next_person.id, 'introduceToPersonName', next_person.full_name,
                          'position', step.position, 'status', step.status, 'followUpAt', step.follow_up_at,
                          'notes', step.notes
                        ) ORDER BY step.position)
                        FROM introduction_steps step
                        JOIN introduction_chains ic ON ic.workspace_id = step.workspace_id AND ic.id = step.chain_id
                        JOIN people target ON target.workspace_id = ic.workspace_id AND target.id = ic.target_person_id
-                      WHERE step.workspace_id = p.workspace_id AND step.to_person_id = p.id AND ic.status = 'ACTIVE'
+                       LEFT JOIN people next_person ON next_person.workspace_id = step.workspace_id AND next_person.id = step.to_person_id
+                      WHERE step.workspace_id = p.workspace_id
+                        AND (
+                          step.responsible_person_id = p.id
+                          OR (step.responsible_person_id IS NULL AND step.from_person_id = p.id)
+                        )
+                        AND ic.status = 'ACTIVE'
                         AND step.status NOT IN ('INTRODUCED', 'COMPLETED', 'DECLINED', 'CANCELLED', 'SKIPPED')), '[]'::jsonb) AS "introductionObligations"
      FROM people p JOIN records r USING (id, workspace_id)
    WHERE p.workspace_id = $1 AND r.archived_at IS NULL`
@@ -906,6 +889,51 @@ async function replaceJunction(
 }
 
 export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): void {
+  app.get('/api/v1/locations/cities', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
+    const raw = String(queryObject(request).q ?? '').trim()
+    const limit = Math.min(Math.max(limitValue(request), 1), 20)
+    if (raw.length < 2) return reply.send({ items: [], attribution: '© OpenStreetMap contributors' })
+
+    const like = escapedLike(raw)
+    const local = like
+      ? await pool.query<{ city: string }>(
+        `SELECT city FROM (
+            SELECT DISTINCT city FROM person_addresses
+             WHERE workspace_id = $1 AND city IS NOT NULL AND city ILIKE $2 ESCAPE '\\'
+            UNION
+            SELECT DISTINCT city FROM company_addresses
+             WHERE workspace_id = $1 AND city IS NOT NULL AND city ILIKE $2 ESCAPE '\\'
+          ) cities
+          ORDER BY city
+          LIMIT $3`,
+        [user.workspaceId, like, limit],
+      )
+      : { rows: [] as Array<{ city: string }> }
+
+    const localItems: CitySuggestion[] = local.rows.map((row) => ({
+      id: row.city,
+      label: row.city,
+      subtitle: 'Used in this workspace',
+    }))
+
+    const remote = await searchProviderCities(raw, Math.max(limit - localItems.length, 4))
+    const seen = new Set(localItems.map((item) => item.label.toLocaleLowerCase()))
+    const merged = [
+      ...localItems,
+      ...remote.filter((item) => {
+        const key = item.label.toLocaleLowerCase()
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      }),
+    ].slice(0, limit)
+
+    return reply.send({
+      items: merged,
+      attribution: '© OpenStreetMap contributors',
+    })
+  }))
+
   app.get('/api/v1/users', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const q = escapedLike(searchText(request))
     const limit = limitValue(request)
@@ -1038,7 +1066,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
 
   app.post('/api/v1/people', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const body = objectBody(request)
-    rejectUnknown(body, ['fullName', 'firstName', 'lastName', 'jobTitle', 'description', 'importance', 'email', 'emails', 'phone', 'phones', 'companyId', 'companyIds', 'introducedByPersonId', 'linkedinUrl', 'links', 'categories', 'street', 'city', 'region', 'postalCode', 'countryName', 'countryCode'])
+    rejectUnknown(body, ['fullName', 'firstName', 'lastName', 'jobTitle', 'description', 'importance', 'email', 'emails', 'phone', 'phones', 'companyId', 'companyIds', 'introducedByPersonId', 'linkedinUrl', 'links', 'categories', 'city'])
     let fullName: string
     if (has(body, 'fullName')) fullName = requiredText(body, 'fullName', 'fullName', 500)
     else fullName = [requiredText(body, 'firstName', 'firstName', 250), requiredText(body, 'lastName', 'lastName', 250)].join(' ').trim()
@@ -1052,7 +1080,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
     const linkedinUrl = has(body, 'linkedinUrl') ? canonicalWebsite(body.linkedinUrl) : null
     const links = urlArray(body, 'links').values
     const categories = taxonomyValues(body, 'categories', 'PERSON_CATEGORY').values
-    const address = addressFields(body)
+    const city = has(body, 'city') ? addressValue(body, 'city') : undefined
 
     const result = await transaction(pool, async (client) => {
       for (const email of emails) await duplicateEmail(client, user.workspaceId, email.normalized)
@@ -1066,7 +1094,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
       )
       if (emails.length) await replacePersonEmails(client, user.workspaceId, record.id, emails)
       if (phones.length) await replacePersonPhones(client, user.workspaceId, record.id, phones)
-      if (address.length) await setPrimaryAddress(client, 'person_addresses', 'person_id', user.workspaceId, record.id, address.map(({ column, value }) => ({ column, value })))
+      if (city !== undefined) await setPrimaryAddressCity(client, 'person_addresses', 'person_id', user.workspaceId, record.id, city)
       if (companies.supplied) await replacePersonCompanies(client, user.workspaceId, record.id, companies.ids)
       if (linkedinUrl) await replacePersonLinkKind(client, user.workspaceId, record.id, 'linkedin', [linkedinUrl])
       if (has(body, 'links')) await replacePersonLinkKind(client, user.workspaceId, record.id, 'other', links)
@@ -1075,7 +1103,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
         'fullName', ...(has(body, 'jobTitle') ? ['jobTitle'] : []), ...(has(body, 'description') ? ['description'] : []),
         ...(has(body, 'importance') ? ['importance'] : []), ...(has(body, 'email') || has(body, 'emails') ? ['emails'] : []),
         ...(has(body, 'phone') || has(body, 'phones') ? ['phones'] : []),
-        ...address.map(({ key }) => key), ...(companies.supplied ? ['companyIds'] : []),
+        ...(city !== undefined ? ['city'] : []), ...(companies.supplied ? ['companyIds'] : []),
         ...(has(body, 'introducedByPersonId') ? ['introducedByPersonId'] : []), ...(has(body, 'linkedinUrl') ? ['linkedinUrl'] : []),
         ...(has(body, 'links') ? ['links'] : []), ...(has(body, 'categories') ? ['categories'] : []),
       ]
@@ -1098,7 +1126,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
   app.patch('/api/v1/people/:id', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const id = recordId(request)
     const body = objectBody(request)
-    rejectUnknown(body, ['version', 'fullName', 'jobTitle', 'description', 'importance', 'email', 'emails', 'phone', 'phones', 'companyId', 'companyIds', 'introducedByPersonId', 'linkedinUrl', 'links', 'categories', 'street', 'city', 'region', 'postalCode', 'countryName', 'countryCode'])
+    rejectUnknown(body, ['version', 'fullName', 'jobTitle', 'description', 'importance', 'email', 'emails', 'phone', 'phones', 'companyId', 'companyIds', 'introducedByPersonId', 'linkedinUrl', 'links', 'categories', 'city'])
     const expected = expectedVersion(request, body)
     const columns: Array<{ column: string; value: unknown }> = []
     const changed: string[] = []
@@ -1113,14 +1141,14 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
     const linkedinUrl = has(body, 'linkedinUrl') ? canonicalWebsite(body.linkedinUrl) : undefined
     const links = urlArray(body, 'links')
     const categories = taxonomyValues(body, 'categories', 'PERSON_CATEGORY')
-    const address = addressFields(body)
+    const city = has(body, 'city') ? addressValue(body, 'city') : undefined
     if (emails.supplied) changed.push(has(body, 'emails') ? 'emails' : 'email')
     if (phones.supplied) changed.push(has(body, 'phones') ? 'phones' : 'phone')
     if (companies.supplied) changed.push(has(body, 'companyIds') ? 'companyIds' : 'companyId')
     if (linkedinUrl !== undefined) changed.push('linkedinUrl')
     if (links.supplied) changed.push('links')
     if (categories.supplied) changed.push('categories')
-    changed.push(...address.map(({ key }) => key))
+    if (city !== undefined) changed.push('city')
     if (introducedBy !== undefined) { columns.push({ column: 'introduced_by_person_id', value: introducedBy }); changed.push('introducedByPersonId') }
     if (!changed.length) throw new HttpError(400, 'At least one field to update is required.')
 
@@ -1139,7 +1167,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
         if (has(body, 'phones')) await replacePersonPhones(client, user.workspaceId, id, phones.values)
         else await setPersonPhone(client, user.workspaceId, id, phones.values[0] ?? null)
       }
-      if (address.length) await setPrimaryAddress(client, 'person_addresses', 'person_id', user.workspaceId, id, address.map(({ column, value }) => ({ column, value })))
+      if (city !== undefined) await setPrimaryAddressCity(client, 'person_addresses', 'person_id', user.workspaceId, id, city)
       if (companies.supplied) await replacePersonCompanies(client, user.workspaceId, id, companies.ids)
       if (linkedinUrl !== undefined) await replacePersonLinkKind(client, user.workspaceId, id, 'linkedin', linkedinUrl ? [linkedinUrl] : [])
       if (links.supplied) await replacePersonLinkKind(client, user.workspaceId, id, 'other', links.values)
@@ -1168,7 +1196,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
 
   app.post('/api/v1/companies', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const body = objectBody(request)
-    rejectUnknown(body, ['name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'domains', 'website', 'links', 'categories', 'industries', 'street', 'city', 'region', 'postalCode', 'countryName', 'countryCode'])
+    rejectUnknown(body, ['name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'domains', 'website', 'links', 'categories', 'industries', 'city'])
     const name = requiredText(body, 'name', 'name', 500)
     const description = has(body, 'description') ? optionalText(body, 'description', 'description', 20_000) : null
     const ownerUserId = has(body, 'ownerUserId') ? uuid(body.ownerUserId, 'ownerUserId', true) : null
@@ -1179,7 +1207,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
     const links = urlArray(body, 'links')
     const categories = taxonomyValues(body, 'categories', 'COMPANY_CATEGORY')
     const industries = taxonomyValues(body, 'industries', 'INDUSTRY')
-    const address = addressFields(body)
+    const city = has(body, 'city') ? addressValue(body, 'city') : undefined
     const result = await transaction(pool, async (client) => {
       await assertUser(client, user.workspaceId, ownerUserId)
       const record = await insertRecord(client, user.workspaceId, user.actorId, 'COMPANY')
@@ -1196,11 +1224,11 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
       if (links.supplied) await replaceCompanyLinks(client, user.workspaceId, record.id, links.values)
       if (categories.supplied) await replaceTaxonomyTerms(client, user.workspaceId, record.id, 'COMPANY_CATEGORY', categories.values)
       if (industries.supplied) await replaceTaxonomyTerms(client, user.workspaceId, record.id, 'INDUSTRY', industries.values)
-      if (address.length) await setPrimaryAddress(client, 'company_addresses', 'company_id', user.workspaceId, record.id, address.map(({ column, value }) => ({ column, value })))
+      if (city !== undefined) await setPrimaryAddressCity(client, 'company_addresses', 'company_id', user.workspaceId, record.id, city)
       await writeActivity(client, user, request, 'COMPANY_CREATED', record.id, [
         'name', ...(has(body, 'description') ? ['description'] : []), ...(domains.supplied ? [has(body, 'domains') ? 'domains' : 'domain'] : []), ...(has(body, 'website') ? ['website'] : []),
         ...(links.supplied ? ['links'] : []), ...(categories.supplied ? ['categories'] : []), ...(industries.supplied ? ['industries'] : []),
-        ...address.map(({ key }) => key), ...(has(body, 'ownerUserId') ? ['ownerUserId'] : []),
+        ...(city !== undefined ? ['city'] : []), ...(has(body, 'ownerUserId') ? ['ownerUserId'] : []),
         ...(has(body, 'customerProfile') ? ['customerProfile'] : []), ...(has(body, 'businessRole') ? ['businessRole'] : []),
       ])
       const created = await client.query(`${COMPANY_SELECT} AND c.id = $2`, [user.workspaceId, record.id])
@@ -1221,7 +1249,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
   app.patch('/api/v1/companies/:id', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const id = recordId(request)
     const body = objectBody(request)
-    rejectUnknown(body, ['version', 'name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'domains', 'website', 'links', 'categories', 'industries', 'street', 'city', 'region', 'postalCode', 'countryName', 'countryCode'])
+    rejectUnknown(body, ['version', 'name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'domains', 'website', 'links', 'categories', 'industries', 'city'])
     const expected = expectedVersion(request, body)
     const columns: Array<{ column: string; value: unknown }> = []
     const changed: string[] = []
@@ -1235,13 +1263,13 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
     const links = urlArray(body, 'links')
     const categories = taxonomyValues(body, 'categories', 'COMPANY_CATEGORY')
     const industries = taxonomyValues(body, 'industries', 'INDUSTRY')
-    const address = addressFields(body)
+    const city = has(body, 'city') ? addressValue(body, 'city') : undefined
     if (domains.supplied) changed.push(has(body, 'domains') ? 'domains' : 'domain')
     if (website !== undefined) changed.push('website')
     if (links.supplied) changed.push('links')
     if (categories.supplied) changed.push('categories')
     if (industries.supplied) changed.push('industries')
-    changed.push(...address.map(({ key }) => key))
+    if (city !== undefined) changed.push('city')
     if (!changed.length) throw new HttpError(400, 'At least one field to update is required.')
     const ownerUserId = columns.find((column) => column.column === 'owner_user_id')?.value as string | null | undefined
     const result = await transaction(pool, async (client) => {
@@ -1265,7 +1293,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
       if (links.supplied) await replaceCompanyLinks(client, user.workspaceId, id, links.values)
       if (categories.supplied) await replaceTaxonomyTerms(client, user.workspaceId, id, 'COMPANY_CATEGORY', categories.values)
       if (industries.supplied) await replaceTaxonomyTerms(client, user.workspaceId, id, 'INDUSTRY', industries.values)
-      if (address.length) await setPrimaryAddress(client, 'company_addresses', 'company_id', user.workspaceId, id, address.map(({ column, value }) => ({ column, value })))
+      if (city !== undefined) await setPrimaryAddressCity(client, 'company_addresses', 'company_id', user.workspaceId, id, city)
       await writeActivity(client, user, request, 'COMPANY_UPDATED', id, changed)
       const updated = await client.query(`${COMPANY_SELECT} AND c.id = $2`, [user.workspaceId, id])
       return { data: updated.rows[0], version }

@@ -78,9 +78,17 @@ app.setNotFoundHandler((request, reply) => {
       detail: 'The requested API resource was not found.', instance: request.url,
     })
   }
-  if (hasWebBuild && request.method === 'GET' && request.headers.accept?.includes('text/html')) {
-    reply.header('cache-control', 'no-store')
-    return reply.type('text/html; charset=utf-8').sendFile('index.html', { maxAge: 0 })
+  // SPA deep links must always get index.html for browser navigations.
+  // Prefer HTML when Accept mentions it, but also fall back for bare GETs
+  // (some clients omit Accept or send */*).
+  if (hasWebBuild && request.method === 'GET') {
+    const accept = request.headers.accept ?? ''
+    const prefersHtml = !accept || accept.includes('text/html') || accept.includes('*/*')
+    const prefersJsonOnly = accept.includes('application/json') && !accept.includes('text/html') && !accept.includes('*/*')
+    if (prefersHtml && !prefersJsonOnly) {
+      reply.header('cache-control', 'no-store')
+      return reply.type('text/html; charset=utf-8').sendFile('index.html', { maxAge: 0 })
+    }
   }
   return reply.code(404).send({ statusCode: 404, error: 'Not Found', message: 'Not found' })
 })

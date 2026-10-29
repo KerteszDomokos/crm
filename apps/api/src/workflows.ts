@@ -781,7 +781,8 @@ export function registerWorkflowRoutes(app: FastifyInstance, { pool }: WorkflowO
     return reply.code(204).send()
   }))
 
-  // Meeting-note state machine: REQUIRED -> COMPLETED or CANCELLED; terminal states cannot be reopened.
+  // Meeting-note state machine: REQUIRED -> COMPLETED or CANCELLED.
+  // Terminal notes cannot be reopened, but COMPLETED content stays editable.
   const MEETING_NOTE_SELECT = `SELECT mn.note_id AS id, mn.event_id AS "eventId", n.title, e.title AS "eventTitle", e.starts_at AS "meetingAt", mn.summary,
     mn.next_steps_markdown AS "nextStepsMarkdown", mn.follow_up_date AS "followUpDate", mn.status,
     mn.cancellation_reason AS "cancellationReason", mn.completed_at AS "completedAt",
@@ -865,8 +866,10 @@ export function registerWorkflowRoutes(app: FastifyInstance, { pool }: WorkflowO
         [user.workspaceId, id],
       )
       if (!current.rowCount) throw new HttpError(404, 'Meeting note not found.')
-      if (status && current.rows[0].status !== 'REQUIRED') throw new HttpError(409, 'Only a REQUIRED meeting note can be completed or cancelled.')
-      if (current.rows[0].status !== 'REQUIRED') throw new HttpError(409, 'A terminal meeting note cannot be edited.')
+      const currentStatus = String(current.rows[0].status ?? 'REQUIRED').toUpperCase()
+      if (status && currentStatus !== 'REQUIRED') throw new HttpError(409, 'Only a REQUIRED meeting note can be completed or cancelled.')
+      if (currentStatus === 'CANCELLED') throw new HttpError(409, 'A cancelled meeting note cannot be edited.')
+      // COMPLETED notes stay completed, but summary / next steps / follow-up remain editable.
       const updates: Array<{ table: 'notes' | 'meeting_notes'; column: string; value: unknown }> = []
       if (title !== undefined) updates.push({ table: 'notes', column: 'title', value: title })
       if (summary !== undefined) updates.push({ table: 'meeting_notes', column: 'summary', value: summary }, { table: 'notes', column: 'body_markdown', value: summary })

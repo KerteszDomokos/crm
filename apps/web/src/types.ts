@@ -253,6 +253,8 @@ export type DashboardData = {
     occurredAt?: string
     actorName?: string
     recordType?: string
+    recordId?: string
+    recordName?: string
   }>
 }
 
