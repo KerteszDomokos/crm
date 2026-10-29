@@ -1,0 +1,29 @@
+{
+  "name": "resoloon-crm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared team CRM for Resoloon",
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "apps/api",
+    "apps/web",
+    "packages/db",
+    "packages/importer"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c green,blue \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "npm run dev -w @resoloon/api",
+    "dev:web": "npm run dev -w @resoloon/web",
+    "build": "npm run build -w @resoloon/web && npm run build -w @resoloon/api",
+    "typecheck": "npm run typecheck -w @resoloon/db && npm run typecheck -w @resoloon/importer && npm run typecheck -w @resoloon/api && npm run typecheck -w @resoloon/web",
+    "test": "npm run test -w @resoloon/importer && npm run test -w @resoloon/api",
+    "migrate": "npm run migrate -w @resoloon/db",
+    "bootstrap:admin": "npm run bootstrap:admin -w @resoloon/api",
+    "import:dry-run": "npm run dry-run -w @resoloon/importer"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

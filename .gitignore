@@ -1,1 +1,12 @@
 data/*
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+coverage/
+apps/web/vite.config.js
+apps/web/vite.config.d.ts
