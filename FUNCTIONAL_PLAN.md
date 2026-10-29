@@ -9,11 +9,21 @@ The first release is complete only when all functionality in this plan is availa
 ## 2. Operating model
 
 - The CRM is used by 3–4 trusted team members in a shared workspace.
-- There is no user login or per-user access restriction inside the CRM.
-- A persistent team-member chooser identifies who is currently using the CRM which can be choosen when first opened, then browser save the person. if thats lost, user selector main screen should appear.
-- Creates, edits, notes, follow-ups, and other actions record the selected team member so the team can see who did what.
+- Every team member has an individual account and logs in with an email address and password.
+- Creates, edits, notes, follow-ups, and other actions automatically record the logged-in user so the team can see who did what.
 - Automated actions identify the connected account owner and indicate that the action was performed by the system.
 - All CRM users can view and edit all CRM information, including eligible email threads belonging to other team members. Emails cant be sent from the system, but reading them is possible for everyone.
+
+### 2.1 Authentication and user administration
+
+- There is no public registration. An administrator creates each user account.
+- The first administrator account is created during initial setup.
+- An administrator can add a user with a name and unique email address from a short, single-screen form.
+- A newly added user receives a password-setup flow and can change their own password later.
+- Users can log out and request a password reset.
+- The system has administrator and standard-user account types. Both can access the shared CRM data; only administrators can manage users and workspace-wide settings.
+- The simple admin panel allows an administrator to list users, add or rename a user, grant or remove administrator status, deactivate or reactivate an account, and reset a user's access.
+- Deactivating a user prevents future login without removing their historical activity, record ownership, or integration history.
 
 ## 3. Main navigation
 
@@ -31,8 +41,9 @@ The left navigation provides access to:
 10. LinkedIn connections
 11. Global search
 12. Settings
+13. Admin panel (administrators only)
 
-The selected team member must remain easy to see and "logout" from every screen on the top right header panel
+The logged-in user's name and a logout action remain visible from every screen in the top-right header panel.
 
 ## 4. Core records
 
@@ -184,7 +195,7 @@ Potential duplicate people and companies are detected during manual creation, CS
 
 ### 7.1 Google Calendar and meeting-note workflow
 
-Each selected team member may have a connected calendar. Calendar data is combined into the shared workspace while retaining its owner.
+Each user may have a connected calendar. Calendar data is combined into the shared workspace while retaining its owner.
 
 Workflow:
 
@@ -208,7 +219,7 @@ An excluded meeting does not create a note task, Linear issue, or new CRM people
 
 ### 7.2 Email visibility and privacy rule
 
-Email accounts are associated with their respective team members. Eligible email threads are visible to the whole CRM team and clearly identify the account owner.
+Email accounts are associated with their respective users. Eligible email threads are visible to the whole CRM team and clearly identify the account owner.
 
 To avoid exposing unrelated personal or company email, a thread's full content is imported and displayed only when at least one external participant can be matched to an existing CRM person. Unmatched email is not parsed into shared CRM content.
 
@@ -250,7 +261,7 @@ MCP changes appear in normal record history and are identified as automated acti
 
 People, companies, notes, and opportunities have a chronological timeline combining relevant notes, meetings, calendar events, email activity, follow-ups, introductions, and record changes.
 
-Each activity indicates its source, date, related records, and the selected team member or connected account responsible for it.
+Each activity indicates its source, date, related records, and the logged-in user or connected account responsible for it.
 
 ## 9. Initial data import
 
@@ -267,7 +278,7 @@ The existing person and company CSV files are imported into the CRM.
 
 Settings cover:
 
-- Team-member list and current team-member selection
+- The logged-in user's profile and password
 - Connected calendar and email account ownership
 - Linear connection and management label
 - Default sales-email follow-up period
@@ -276,14 +287,45 @@ Settings cover:
 - Email addresses excluded from CRM and ever creating a person for them
 - LinkedIn CSV import and import history
 - Integration status and retryable errors
+- Manual full-backup download
+
+Workspace-wide integration and workflow settings are editable by administrators. Standard users can manage their own profile, password, and connected accounts.
+
+The administrator-only user panel covers:
+
+- Adding users
+- Renaming users and changing their email addresses
+- Granting or removing administrator status
+- Deactivating and reactivating accounts
+- Resetting account access
+
+### 10.1 Manual full backup
+
+Administrators have a **Download full backup** button in the settings or admin panel. After confirmation, the CRM creates and downloads a timestamped ZIP file containing all CRM-managed data, including:
+
+- People, companies, opportunities, notes, and their relationships
+- Follow-ups, warm-introduction chains, events, and meeting information
+- Eligible stored email threads and sales-email tracking data
+- LinkedIn connection data and import history
+- Users, account status, record ownership, and activity history
+- Workspace settings and integration configuration
+- Uploaded or imported source files retained by the CRM
+- A manifest describing when the backup was created and what it contains
+
+The backup must contain enough information to support a complete future restore without losing relationships or history. Plaintext passwords and active external-service credentials are not included; integrations can be reconnected after restoration.
+
+The CRM shows backup progress and a clear success or failure result. Creating a backup is recorded in the activity history. Scheduled automatic backups are planned for a later release and are not required for the first release.
 
 ## 11. Delivery increments
 
 ### Increment 1 — Shared CRM foundation
 
-- Team-member chooser and action attribution
+- Email-and-password login, logout, and password reset
+- Simple administrator panel and user lifecycle management
+- Logged-in user action attribution
 - People, companies, opportunities, notes, and relationships
 - Initial CSV import
+- Administrator full-backup ZIP download
 - Record timelines
 - Global search
 - Duplicate detection and merging
@@ -299,7 +341,7 @@ Settings cover:
 
 ### Increment 3 — Email workflow
 
-- Per-team-member connected email accounts
+- Per-user connected email accounts
 - Privacy-gated full-thread import
 - Automatic person and company matching
 - Sales-email tracking
@@ -323,7 +365,10 @@ Settings cover:
 The first release is functionally complete when:
 
 - Existing person and company data can be imported without losing meaningful information or relationships.
-- Team actions are attributed through the team-member chooser without requiring login.
+- Users can log in with individual accounts, and team actions are attributed to the logged-in user.
+- Administrators can add, rename, deactivate, reactivate, and reset access for users from a simple admin panel.
+- Deactivated users cannot log in, and their historical activity remains intact.
+- An administrator can download a timestamped ZIP containing all CRM-managed data needed for a future complete restore.
 - Users can manage all core records and relationships from the UI.
 - Search finds relevant information across records, notes, events, and eligible email content.
 - Duplicate suggestions and confirmed merges preserve related history.
