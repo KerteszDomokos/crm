@@ -1,5 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { Pool } from 'pg'
+import { loadLocalEnv } from './env.js'
+
+loadLocalEnv()
 
 const email = process.env.ADMIN_EMAIL?.trim().toLowerCase()
 const fullName = process.env.ADMIN_NAME?.trim()

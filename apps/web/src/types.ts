@@ -61,6 +61,122 @@ export type NoteRecord = {
   opportunityName?: string | null
 }
 
+export type RelatedRecordSummary = {
+  id?: string
+  type?: string
+  name?: string
+  [key: string]: unknown
+}
+
+export type EventAttendee = string | {
+  id?: string
+  name?: string
+  email?: string
+  responseStatus?: string
+  [key: string]: unknown
+}
+
+export type EventRecord = {
+  id: string
+  title?: string
+  description?: string | null
+  startAt?: string | null
+  endAt?: string | null
+  startsAt?: string | null
+  endsAt?: string | null
+  start?: string | null
+  end?: string | null
+  allDay?: boolean
+  timezone?: string | null
+  sourceTimezone?: string | null
+  organizer?: string | null
+  organizerName?: string | null
+  ownerUserId?: string | null
+  location?: string | null
+  meetingUrl?: string | null
+  source?: string | null
+  status?: string | null
+  workflowEligible?: boolean
+  exclusionReason?: string | null
+  meetingNoteStatus?: string | null
+  attendees?: EventAttendee[]
+  personIds?: string[]
+  companyIds?: string[]
+  opportunityIds?: string[]
+  relatedRecords?: RelatedRecordSummary[]
+  createdAt?: string
+  updatedAt?: string
+  [key: string]: unknown
+}
+
+export type FollowUpRecord = {
+  id: string
+  title?: string
+  body?: string | null
+  dueAt?: string | null
+  status?: string | null
+  source?: string | null
+  assigneeName?: string | null
+  assigneeUserId?: string | null
+  relatedRecords?: RelatedRecordSummary[]
+  personName?: string | null
+  companyName?: string | null
+  opportunityName?: string | null
+  createdAt?: string
+  updatedAt?: string
+  [key: string]: unknown
+}
+
+export type IntroductionStep = {
+  id?: string
+  position?: number
+  fromPersonId?: string | null
+  toPersonId?: string | null
+  responsibleUserId?: string | null
+  responsiblePersonId?: string | null
+  fromPersonName?: string | null
+  toPersonName?: string | null
+  responsibleName?: string | null
+  status?: string | null
+  notes?: string | null
+  requestedAt?: string | null
+  followUpDate?: string | null
+  followUpAt?: string | null
+  [key: string]: unknown
+}
+
+export type WarmIntroductionRecord = {
+  id: string
+  targetPersonId?: string | null
+  ownerUserId?: string | null
+  targetPersonName?: string | null
+  ownerName?: string | null
+  status?: string | null
+  currentStep?: number | null
+  steps?: IntroductionStep[]
+  createdAt?: string
+  updatedAt?: string
+  [key: string]: unknown
+}
+
+export type MeetingNoteRequirementRecord = {
+  id: string
+  eventId?: string | null
+  eventTitle?: string | null
+  title?: string | null
+  meetingAt?: string | null
+  status?: string | null
+  summary?: string | null
+  nextStepsMarkdown?: string | null
+  followUpDate?: string | null
+  cancellationReason?: string | null
+  completedAt?: string | null
+  cancelledAt?: string | null
+  createdAt?: string
+  updatedAt?: string
+  [key: string]: unknown
+}
+
 export type UserIdentity = {
   fullName?: string
   name?: string

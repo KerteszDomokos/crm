@@ -1,7 +1,15 @@
 import Fastify from 'fastify'
+import fastifyStatic from '@fastify/static'
+import { existsSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Pool } from 'pg'
 import { registerAuthRoutes } from './auth.js'
 import { registerCrmRoutes } from './crm.js'
+import { registerWorkflowRoutes } from './workflows.js'
+import { loadLocalEnv } from './env.js'
+
+loadLocalEnv()
 
 function required(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback
@@ -55,6 +63,13 @@ app.get('/health/ready', async (_request, reply) => {
 
 registerAuthRoutes(app, { pool, secureCookies, cookieName, sessionTtlDays, publicOrigin })
 registerCrmRoutes(app, { pool })
+registerWorkflowRoutes(app, { pool })
+
+const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../web/dist')
+const hasWebBuild = existsSync(resolve(webRoot, 'index.html'))
+if (hasWebBuild) {
+  await app.register(fastifyStatic, { root: webRoot, prefix: '/', wildcard: true })
+}
 
 app.setNotFoundHandler((request, reply) => {
   if (request.url.startsWith('/api/')) {
@@ -62,6 +77,10 @@ app.setNotFoundHandler((request, reply) => {
       type: 'about:blank', title: 'Not Found', status: 404,
       detail: 'The requested API resource was not found.', instance: request.url,
     })
+  }
+  if (hasWebBuild && request.method === 'GET' && request.headers.accept?.includes('text/html')) {
+    reply.header('cache-control', 'no-store')
+    return reply.type('text/html; charset=utf-8').sendFile('index.html', { maxAge: 0 })
   }
   return reply.code(404).send({ statusCode: 404, error: 'Not Found', message: 'Not found' })
 })

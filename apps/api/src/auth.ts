@@ -259,6 +259,20 @@ function publicUser(user: AuthUser): { id: string; workspaceId: string; fullName
   }
 }
 
+async function writeAuthActivity(
+  client: PoolClient,
+  actor: AuthUser,
+  action: string,
+  fields: string[],
+  requestId?: string,
+): Promise<void> {
+  await client.query(
+    `INSERT INTO activity_events (workspace_id, actor_id, owner_user_id, action, source, request_id, changed_fields)
+     VALUES ($1, $2, $3, $4, 'ADMIN', $5, $6::jsonb)`,
+    [actor.workspaceId, actor.actorId, actor.userId, action, requestId ?? null, JSON.stringify({ fields })],
+  )
+}
+
 export async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
   if (!(request as AuthenticatedRequest).authUser) {
     problem(request, reply, 401, 'Unauthorized', 'Authentication is required.')
@@ -303,6 +317,11 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRouteOptio
 
   // Resolve the opaque cookie once per request. Only the token hash is sent to PostgreSQL.
   app.addHook('onRequest', async (request, reply) => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method) && !validOrigin(request, expectedOrigin)) {
+      problem(request, reply, 403, 'Forbidden', 'The request origin is not allowed.')
+      return
+    }
+
     const authRequest = request as AuthenticatedRequest
     authRequest.authUser = null
     const token = sessionCookie(request, cookieName)
@@ -455,6 +474,10 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRouteOptio
   app.post('/api/v1/auth/setup', async (request, reply) => {
     noStore(reply)
     if (!allowMutation(request, reply, expectedOrigin)) return
+    if (limited(request)) {
+      reply.header('retry-after', '60')
+      return problem(request, reply, 429, 'Too Many Requests', 'Please wait before trying again.')
+    }
 
     const body = parseBody<{ token: string; password: string }>(request.body)
     if (
@@ -547,6 +570,15 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRouteOptio
         )
         const actorId = actor.rows[0]?.id
         if (!actorId) throw new Error('Unable to establish user actor')
+        await writeAuthActivity(client, {
+          userId: current.user_id,
+          workspaceId: current.workspace_id,
+          actorId,
+          sessionId: '',
+          fullName: current.full_name,
+          email: current.email,
+          role: current.role,
+        }, 'ACCOUNT_ACTIVATED', ['passwordSet', 'accountState'], request.id)
 
         const session = await client.query<{ id: string }>(
           `INSERT INTO sessions (workspace_id, user_id, token_hash, expires_at, user_agent)
@@ -646,6 +678,7 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRouteOptio
            VALUES ($1, $2, 'SETUP', $3, $4, $5)`,
           [admin.workspaceId, newUser.id, tokenHash, admin.actorId, expiresAt],
         )
+        await writeAuthActivity(client, admin, 'USER_CREATED', ['fullName', 'email', 'role', 'state'], request.id)
         return newUser
       })
       return reply.code(201).send({
@@ -763,6 +796,7 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRouteOptio
             [admin.workspaceId, id],
           )
         }
+        await writeAuthActivity(client, admin, 'USER_UPDATED', updates.map(({ column }) => column), request.id)
         return { kind: 'updated' as const, user: updated.rows[0] }
       })
       if (user.kind === 'missing') return problem(request, reply, 404, 'Not Found', 'The user was not found.')
@@ -812,6 +846,7 @@ export function registerAuthRoutes(app: FastifyInstance, options: AuthRouteOptio
            VALUES ($1, $2, 'PASSWORD_RESET', $3, $4, $5)`,
           [admin.workspaceId, id, tokenHash, admin.actorId, expiresAt],
         )
+        await writeAuthActivity(client, admin, 'USER_ACCESS_RESET_LINK_ISSUED', ['accountAccessReset'], request.id)
         return true
       })
       if (!issued) return problem(request, reply, 404, 'Not Found', 'The user was not found or is unavailable.')

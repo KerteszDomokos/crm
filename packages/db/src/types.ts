@@ -28,6 +28,25 @@ export type ImportRowStatus =
   | 'REVIEW_REQUIRED'
   | 'IGNORED'
 export type ImportReviewState = 'NOT_REQUIRED' | 'PENDING' | 'APPROVED' | 'REJECTED'
+export type EventStatus = 'CONFIRMED' | 'TENTATIVE' | 'CANCELLED'
+export type EventSource = 'LOCAL' | 'SYNCED'
+export type EventAttendeeResponseStatus = 'NEEDS_ACTION' | 'ACCEPTED' | 'DECLINED' | 'TENTATIVE' | 'UNKNOWN'
+export type EventAttendeeReviewState = 'NOT_REQUIRED' | 'PENDING' | 'CONFIRMED' | 'IGNORED'
+export type MeetingNoteStatus = 'REQUIRED' | 'COMPLETED' | 'CANCELLED'
+export type FollowUpStatus = 'OPEN' | 'COMPLETED' | 'CANCELLED'
+export type FollowUpSource = string
+export type ReminderStatus = 'SCHEDULED' | 'DELIVERED' | 'DISMISSED' | 'CANCELLED' | 'FAILED'
+export type IntroductionChainStatus = 'ACTIVE' | 'COMPLETED' | 'CANCELLED'
+export type IntroductionStepStatus =
+  | 'PLANNED'
+  | 'PENDING'
+  | 'REQUESTED'
+  | 'ACCEPTED'
+  | 'INTRODUCED'
+  | 'COMPLETED'
+  | 'DECLINED'
+  | 'CANCELLED'
+  | 'SKIPPED'
 
 /** PostgreSQL timestamptz is returned as a Date by node-postgres. */
 export type Timestamp = ColumnType<Date, Date | string | undefined, Date | string>
@@ -187,6 +206,7 @@ export interface PersonAddressesTable {
   region: Nullable<string>
   postal_code: Nullable<string>
   country_code: Nullable<string>
+  country_name: Nullable<string>
   latitude: Nullable<number>
   longitude: Nullable<number>
   provider_place_id: Nullable<string>
@@ -235,6 +255,7 @@ export interface CompanyAddressesTable {
   region: Nullable<string>
   postal_code: Nullable<string>
   country_code: Nullable<string>
+  country_name: Nullable<string>
   latitude: Nullable<number>
   longitude: Nullable<number>
   provider_place_id: Nullable<string>
@@ -389,6 +410,179 @@ export interface ExternalReferencesTable {
   updated_at: Timestamp
 }
 
+export interface EventsTable {
+  id: Generated<UUID>
+  workspace_id: UUID
+  title: string
+  description: Nullable<string>
+  starts_at: Timestamp
+  ends_at: Timestamp
+  all_day: Generated<boolean>
+  source_timezone: Generated<string>
+  organizer: Nullable<string>
+  organizer_name: Nullable<string>
+  organizer_email: Nullable<string>
+  organizer_user_id: Nullable<UUID>
+  owner_user_id: Nullable<UUID>
+  location: Nullable<string>
+  meeting_url: Nullable<string>
+  status: Generated<EventStatus>
+  source: Generated<EventSource>
+  is_read_only: boolean
+  recurrence_identity: Nullable<string>
+  workflow_eligible: Generated<boolean>
+  exclusion_reason: Nullable<string>
+  settings_version: Generated<number>
+  created_by_actor_id: Nullable<UUID>
+  updated_by_actor_id: Nullable<UUID>
+  created_at: Timestamp
+  updated_at: Timestamp
+}
+
+export interface EventAttendeesTable {
+  id: Generated<UUID>
+  workspace_id: UUID
+  event_id: UUID
+  display_name: Nullable<string>
+  email: Nullable<string>
+  normalized_email: Nullable<string>
+  response_status: Generated<EventAttendeeResponseStatus>
+  is_internal: Generated<boolean>
+  is_organizer: Generated<boolean>
+  matched_person_id: Nullable<UUID>
+  matched_user_id: Nullable<UUID>
+  review_state: Generated<EventAttendeeReviewState>
+  reviewed_by_actor_id: Nullable<UUID>
+  reviewed_at: NullableTimestamp
+  created_by_actor_id: UUID
+  updated_by_actor_id: UUID
+  created_at: Timestamp
+  updated_at: Timestamp
+}
+
+export interface EventPeopleTable {
+  workspace_id: UUID
+  event_id: UUID
+  person_id: UUID
+  created_by_actor_id: Nullable<UUID>
+  created_at: Timestamp
+}
+
+export interface EventCompaniesTable {
+  workspace_id: UUID
+  event_id: UUID
+  company_id: UUID
+  created_by_actor_id: Nullable<UUID>
+  created_at: Timestamp
+}
+
+export interface EventOpportunitiesTable {
+  workspace_id: UUID
+  event_id: UUID
+  opportunity_id: UUID
+  created_by_actor_id: Nullable<UUID>
+  created_at: Timestamp
+}
+
+export interface MeetingNotesTable {
+  note_id: UUID
+  workspace_id: UUID
+  event_id: UUID
+  summary: Generated<string>
+  next_steps_markdown: Generated<string>
+  follow_up_date: NullableDateOnly
+  status: Generated<MeetingNoteStatus>
+  cancellation_reason: Nullable<string>
+  completed_by_actor_id: Nullable<UUID>
+  completed_at: NullableTimestamp
+  cancelled_by_actor_id: Nullable<UUID>
+  cancelled_at: NullableTimestamp
+  created_by_actor_id: Nullable<UUID>
+  updated_by_actor_id: Nullable<UUID>
+  created_at: Timestamp
+  updated_at: Timestamp
+}
+
+export interface FollowUpsTable {
+  id: Generated<UUID>
+  workspace_id: UUID
+  title: string
+  body: Nullable<string>
+  due_at: NullableTimestamp
+  assignee_user_id: Nullable<UUID>
+  status: Generated<FollowUpStatus>
+  source: FollowUpSource
+  source_event_id: Nullable<UUID>
+  source_meeting_note_id: Nullable<UUID>
+  completed_by_actor_id: Nullable<UUID>
+  completed_at: NullableTimestamp
+  cancelled_by_actor_id: Nullable<UUID>
+  cancelled_at: NullableTimestamp
+  cancellation_reason: Nullable<string>
+  created_by_actor_id: Nullable<UUID>
+  updated_by_actor_id: Nullable<UUID>
+  created_at: Timestamp
+  updated_at: Timestamp
+}
+
+export interface FollowUpRecordsTable {
+  workspace_id: UUID
+  follow_up_id: UUID
+  record_id: UUID
+  relationship: Generated<'RELATED' | 'SOURCE'>
+  created_by_actor_id: Nullable<UUID>
+  created_at: Timestamp
+}
+
+export interface RemindersTable {
+  id: Generated<UUID>
+  workspace_id: UUID
+  follow_up_id: UUID
+  scheduled_at: Timestamp
+  status: Generated<ReminderStatus>
+  delivered_at: NullableTimestamp
+  dismissed_at: NullableTimestamp
+  dismissed_by_actor_id: Nullable<UUID>
+  cancelled_at: NullableTimestamp
+  cancelled_by_actor_id: Nullable<UUID>
+  failure_reason: Nullable<string>
+  created_by_actor_id: UUID
+  updated_by_actor_id: UUID
+  created_at: Timestamp
+  updated_at: Timestamp
+}
+
+export interface IntroductionChainsTable {
+  id: Generated<UUID>
+  workspace_id: UUID
+  target_person_id: UUID
+  owner_user_id: UUID
+  status: Generated<IntroductionChainStatus>
+  created_by_actor_id: Nullable<UUID>
+  updated_by_actor_id: Nullable<UUID>
+  created_at: Timestamp
+  updated_at: Timestamp
+}
+
+export interface IntroductionStepsTable {
+  id: Generated<UUID>
+  workspace_id: UUID
+  chain_id: UUID
+  position: number
+  from_person_id: Nullable<UUID>
+  to_person_id: UUID
+  responsible_user_id: Nullable<UUID>
+  responsible_person_id: Nullable<UUID>
+  status: Generated<IntroductionStepStatus>
+  notes: Nullable<string>
+  requested_at: NullableTimestamp
+  follow_up_at: NullableTimestamp
+  created_by_actor_id: Nullable<UUID>
+  updated_by_actor_id: Nullable<UUID>
+  created_at: Timestamp
+  updated_at: Timestamp
+}
+
 export interface ActivityEventsTable {
   id: Generated<UUID>
   workspace_id: UUID
@@ -462,6 +656,17 @@ export interface Database {
   import_batches: ImportBatchesTable
   import_rows: ImportRowsTable
   external_references: ExternalReferencesTable
+  events: EventsTable
+  event_attendees: EventAttendeesTable
+  event_people: EventPeopleTable
+  event_companies: EventCompaniesTable
+  event_opportunities: EventOpportunitiesTable
+  meeting_notes: MeetingNotesTable
+  follow_ups: FollowUpsTable
+  follow_up_records: FollowUpRecordsTable
+  reminders: RemindersTable
+  introduction_chains: IntroductionChainsTable
+  introduction_steps: IntroductionStepsTable
   activity_events: ActivityEventsTable
   activity_records: ActivityRecordsTable
   outbox_events: OutboxEventsTable

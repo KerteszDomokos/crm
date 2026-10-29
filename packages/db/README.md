@@ -39,6 +39,20 @@ erDiagram
   RECORDS ||--o{ EXTERNAL_REFERENCES : maps
   IMPORT_ROWS o|--o{ EXTERNAL_REFERENCES : provenance
   ACTORS ||--o{ EXTERNAL_REFERENCES : attributes
+  WORKSPACES ||--o{ EVENTS : scopes
+  EVENTS ||--o{ EVENT_ATTENDEES : includes
+  EVENTS }o--o{ PEOPLE : event_people
+  EVENTS }o--o{ COMPANIES : event_companies
+  EVENTS }o--o{ OPPORTUNITIES : event_opportunities
+  EVENTS ||--o| MEETING_NOTES : requires
+  NOTES ||--o| MEETING_NOTES : specializes
+  WORKSPACES ||--o{ FOLLOW_UPS : scopes
+  USERS o|--o{ FOLLOW_UPS : assigned
+  FOLLOW_UPS }o--o{ RECORDS : follow_up_records
+  FOLLOW_UPS ||--o{ REMINDERS : schedules
+  PEOPLE ||--o{ INTRODUCTION_CHAINS : target
+  USERS ||--o{ INTRODUCTION_CHAINS : owns
+  INTRODUCTION_CHAINS ||--o{ INTRODUCTION_STEPS : orders
   ACTORS ||--o{ ACTIVITY_EVENTS : performs
   ACTIVITY_EVENTS }o--o{ RECORDS : activity_records
   WORKSPACES ||--o{ OUTBOX_EVENTS : queues
@@ -52,13 +66,14 @@ also carry the workspace key, preventing cross-workspace relationships.
 
 ## Apply migrations
 
-This folder is self-contained. Install its declared dependencies, set
-`DATABASE_URL` to a PostgreSQL 17 database, then run `npm run migrate` from this
-directory. Each numbered SQL file is applied in its own transaction under a
+Install workspace dependencies once from the repository root with `npm ci`.
+Set `DATABASE_URL` to a PostgreSQL 17 database, then run `npm run migrate` from
+the repository root (or this workspace). Each numbered SQL file is applied in its own transaction under a
 PostgreSQL advisory lock. Applied files are SHA-256 checked; never edit an
 applied migration—add the next numbered file. `002_import_tracking.sql` adds
-workspace-scoped import staging and external source mappings. The runner creates
-`public.schema_migrations`.
+workspace-scoped import staging and external source mappings; `003_workflows.sql`
+adds local workflow storage; `004_address_country.sql` adds raw/display country
+labels to person and company addresses. The runner creates `public.schema_migrations`.
 
 ## Mutation and security contracts
 
@@ -87,6 +102,8 @@ workspace-scoped import staging and external source mappings. The runner creates
   application and stored in the corresponding normalized columns. Partial unique
   indexes block duplicate active email identities, E.164 phones, domains, and
   canonical links.
+- Address `country_code` stores the ISO alpha-2 code; nullable `country_name`
+  preserves the raw/display country label needed by legacy imports.
 - Import batches are idempotently identified by workspace, import type, and the
   SHA-256 digest of the original source bytes (stored as 32-byte `bytea`, not a
   filename hash). On a uniqueness conflict, reuse the existing batch rather than
@@ -101,8 +118,37 @@ workspace-scoped import staging and external source mappings. The runner creates
   canonical names). Its record, actor, and optional import-row provenance links
   are workspace-scoped; mappings can be retargeted during a record merge, but
   their source identity and origin cannot be rewritten.
+- Events use independent workspace-scoped IDs rather than consuming core record
+  types. `source` distinguishes local events from synchronized read-only
+  events without introducing Google account, cursor, or provider-object tables.
+  Attendees support internal/user and CRM-person matching plus an explicit
+  review state. Event relationships use separate typed junctions to people,
+  companies, and opportunities.
+- `meeting_notes` specializes a core `notes` row of type `MEETING`, uniquely
+  associates it with an event, and records required/completed/cancelled state.
+  Completion and cancellation are actor-attributed; cancellation requires a
+  reason. Notes remain normal core records for timelines and activity.
+- Follow-ups have `OPEN`, `COMPLETED`, or `CANCELLED` status, optional user
+  assignee, source metadata, and workspace-scoped relationships to core records.
+  Event and meeting-note source links are explicit where applicable. Reminders
+  are uniquely scheduled per follow-up/time and retain their delivery or
+  dismissal state.
+- Introduction chains point to a target person and owner; step positions are
+  unique within each chain and each step references its people/responsible actor.
+  The current step is derived as the first nonterminal step, avoiding a stale
+  duplicated pointer. Completion/cancellation uses state metadata where
+  defined; synchronized events, meeting notes, and reminders cannot be
+  hard-deleted. Local event/follow-up/chain deletions remain auditable through
+  append-only activity events.
+- Events and follow-ups are not `records`. For their activity entries, leave
+  `activity_events.primary_record_id` null and attach only actual related core
+  record IDs through `activity_records`; meeting-note activity can use its note
+  record as primary. Activity attribution is carried by `activity_events`; the
+  workflow rows also accept workspace-scoped actor attribution where supplied.
+  No Google or Linear synchronization internals are defined.
 
 This slice covers core CRM records, notes/taxonomies, identity, activity,
-transactional outbox, and import tracking. Events, meeting-note state machines,
-follow-ups, email, integration credentials, MCP-client administration, search
-projections, and operations are later schema slices.
+transactional outbox, import tracking, and local events/follow-ups/reminders/
+introductions. Google and Linear synchronization internals, email, integration
+credentials, MCP-client administration, search projections, and operations are
+later schema slices.

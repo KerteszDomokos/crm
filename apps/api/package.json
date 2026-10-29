@@ -9,19 +9,21 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node --experimental-strip-types --test test/*.test.ts",
-    "bootstrap:admin": "tsx src/bootstrap-admin.ts"
+    "test": "tsx --test test/*.test.ts",
+    "bootstrap:admin": "tsx src/bootstrap-admin.ts",
+    "import:legacy": "tsx src/import-legacy.ts"
   },
   "dependencies": {
-    "@fastify/static": "^8.2.0",
+    "@fastify/static": "^10.1.8",
     "@resoloon/db": "*",
+    "@resoloon/importer": "*",
     "fastify": "^5.5.0",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "tsx": "^4.20.5"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/pg": "^8.15.5",
-    "tsx": "^4.20.5",
     "typescript": "^5.9.2"
   }
 }

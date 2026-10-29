@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { readdir, readFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Kysely, PostgresDialect, sql } from 'kysely'
 import pg from 'pg'
@@ -7,6 +9,8 @@ import pg from 'pg'
 import type { Database } from './types.js'
 
 const { Pool } = pg
+const repositoryEnvFile = resolve(dirname(fileURLToPath(import.meta.url)), '../../../.env')
+if (existsSync(repositoryEnvFile)) process.loadEnvFile(repositoryEnvFile)
 const LOCK_CLASS_ID = 1_380_928_333
 const LOCK_OBJECT_ID = 1
 const migrationsDirectory = fileURLToPath(new URL('../migrations/', import.meta.url))

@@ -21,6 +21,7 @@
     "test": "npm run test -w @resoloon/importer && npm run test -w @resoloon/api",
     "migrate": "npm run migrate -w @resoloon/db",
     "bootstrap:admin": "npm run bootstrap:admin -w @resoloon/api",
+    "import:legacy": "npm run import:legacy -w @resoloon/api --",
     "import:dry-run": "npm run dry-run -w @resoloon/importer"
   },
   "devDependencies": {

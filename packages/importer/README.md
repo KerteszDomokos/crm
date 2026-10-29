@@ -31,14 +31,15 @@ relationship guess is performed.
 
 ## Commands
 
-Requires Node.js 24+ and, for typechecking, installed local development
-dependencies. From this directory:
+Requires Node.js 24+ and, for typechecking, installed workspace development
+dependencies. Install with `npm ci` from the repository root, then run from the
+repository root:
 
 ```sh
-npm test
-npm run typecheck
-npm run --silent dry-run                  # reads ../../data/{person,company,note}.csv
-npm run --silent dry-run -- /path/to/csvs # directory containing those three files
+npm test -w @resoloon/importer
+npm run typecheck -w @resoloon/importer
+npm run --silent import:dry-run           # reads data/{person,company,note}.csv
+npm run --silent import:dry-run -- /path/to/csvs # directory containing the three files
 ```
 
 Dry-run output is JSON containing aggregate counts, all row issues, and

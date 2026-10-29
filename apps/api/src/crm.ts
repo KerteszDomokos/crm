@@ -157,7 +157,8 @@ function isoTimestamp(value: unknown, field: string, nullable = false): string |
 function emailAddress(value: unknown): { raw: string; normalized: string } | null {
   if (value === null) return null
   const raw = text(value, 'email', { required: true, max: 320 }) as string
-  const normalized = raw.toLowerCase()
+  const at = raw.lastIndexOf('@')
+  const normalized = `${raw.slice(0, at)}@${raw.slice(at + 1).toLowerCase()}`
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) throw new HttpError(400, 'email must be a valid email address.')
   return { raw, normalized }
 }
@@ -448,6 +449,28 @@ async function setPersonPhone(client: PoolClient, workspaceId: string, personId:
   }
 }
 
+async function setPrimaryAddressCity(
+  client: PoolClient,
+  table: 'person_addresses' | 'company_addresses',
+  ownerColumn: 'person_id' | 'company_id',
+  workspaceId: string,
+  ownerId: string,
+  city: string | null,
+) {
+  const current = await client.query(
+    `SELECT id FROM ${table} WHERE workspace_id = $1 AND ${ownerColumn} = $2 AND is_primary FOR UPDATE`,
+    [workspaceId, ownerId],
+  )
+  if (current.rowCount) {
+    await client.query(`UPDATE ${table} SET city = $3 WHERE workspace_id = $1 AND id = $2`, [workspaceId, current.rows[0].id, city])
+  } else if (city) {
+    await client.query(
+      `INSERT INTO ${table} (workspace_id, ${ownerColumn}, city, is_primary) VALUES ($1, $2, $3, true)`,
+      [workspaceId, ownerId, city],
+    )
+  }
+}
+
 async function setPersonCompany(client: PoolClient, workspaceId: string, personId: string, companyId: string | null) {
   if (companyId) await assertIds(client, workspaceId, [companyId], 'companies')
   await client.query(
@@ -475,9 +498,26 @@ const PERSON_SELECT = `
                    FROM person_phones ph WHERE ph.workspace_id = p.workspace_id AND ph.person_id = p.id), '[]'::jsonb) AS phones,
          (SELECT c.id FROM person_companies pc JOIN companies c ON c.workspace_id = pc.workspace_id AND c.id = pc.company_id
            WHERE pc.workspace_id = p.workspace_id AND pc.person_id = p.id AND pc.is_primary AND pc.ended_on IS NULL LIMIT 1) AS "companyId",
-         (SELECT c.name FROM person_companies pc JOIN companies c ON c.workspace_id = pc.workspace_id AND c.id = pc.company_id
-           WHERE pc.workspace_id = p.workspace_id AND pc.person_id = p.id AND pc.is_primary AND pc.ended_on IS NULL LIMIT 1) AS "companyName"
-    FROM people p JOIN records r USING (id, workspace_id)
+          (SELECT c.name FROM person_companies pc JOIN companies c ON c.workspace_id = pc.workspace_id AND c.id = pc.company_id
+            WHERE pc.workspace_id = p.workspace_id AND pc.person_id = p.id AND pc.is_primary AND pc.ended_on IS NULL LIMIT 1) AS "companyName"
+          ,(SELECT a.city FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS city
+          ,(SELECT a.region FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS region
+          ,(SELECT a.country_name FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS "countryName"
+          ,(SELECT a.country_code FROM person_addresses a WHERE a.workspace_id = p.workspace_id AND a.person_id = p.id AND a.is_primary LIMIT 1) AS "countryCode"
+          ,COALESCE((SELECT jsonb_agg(t.label ORDER BY t.normalized_label)
+                       FROM record_taxonomies rt JOIN taxonomy_terms t ON t.workspace_id = rt.workspace_id AND t.id = rt.taxonomy_term_id
+                      WHERE rt.workspace_id = p.workspace_id AND rt.record_id = p.id AND t.taxonomy = 'PERSON_CATEGORY'), '[]'::jsonb) AS categories
+          ,COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                         'chainId', ic.id, 'targetPersonId', target.id, 'targetPersonName', target.full_name,
+                         'position', step.position, 'status', step.status, 'followUpAt', step.follow_up_at,
+                         'notes', step.notes
+                       ) ORDER BY step.position)
+                       FROM introduction_steps step
+                       JOIN introduction_chains ic ON ic.workspace_id = step.workspace_id AND ic.id = step.chain_id
+                       JOIN people target ON target.workspace_id = ic.workspace_id AND target.id = ic.target_person_id
+                      WHERE step.workspace_id = p.workspace_id AND step.to_person_id = p.id AND ic.status = 'ACTIVE'
+                        AND step.status NOT IN ('INTRODUCED', 'COMPLETED', 'DECLINED', 'CANCELLED', 'SKIPPED')), '[]'::jsonb) AS "introductionObligations"
+     FROM people p JOIN records r USING (id, workspace_id)
    WHERE p.workspace_id = $1 AND r.archived_at IS NULL`
 
 const COMPANY_SELECT = `
@@ -485,11 +525,21 @@ const COMPANY_SELECT = `
          c.business_role AS "businessRole", r.version, r.created_at AS "createdAt", r.updated_at AS "updatedAt",
          (SELECT d.raw_domain FROM company_domains d WHERE d.workspace_id = c.workspace_id AND d.company_id = c.id AND d.is_primary LIMIT 1) AS domain,
          (SELECT l.raw_url FROM company_links l WHERE l.workspace_id = c.workspace_id AND l.company_id = c.id AND l.is_primary LIMIT 1) AS website,
-         COALESCE((SELECT jsonb_agg(jsonb_build_object('id', p.id, 'fullName', p.full_name, 'jobTitle', pc.job_title)
+          COALESCE((SELECT jsonb_agg(jsonb_build_object('id', p.id, 'fullName', p.full_name, 'jobTitle', pc.job_title)
                     ORDER BY pc.is_primary DESC, p.full_name)
                    FROM person_companies pc JOIN people p ON p.workspace_id = pc.workspace_id AND p.id = pc.person_id
                    WHERE pc.workspace_id = c.workspace_id AND pc.company_id = c.id AND pc.ended_on IS NULL), '[]'::jsonb) AS people,
-         (SELECT count(*)::integer FROM person_companies pc WHERE pc.workspace_id = c.workspace_id AND pc.company_id = c.id AND pc.ended_on IS NULL) AS "peopleCount"
+          (SELECT count(*)::integer FROM person_companies pc WHERE pc.workspace_id = c.workspace_id AND pc.company_id = c.id AND pc.ended_on IS NULL) AS "peopleCount",
+          (SELECT a.city FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS city,
+          (SELECT a.region FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS region,
+          (SELECT a.country_name FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS "countryName",
+          (SELECT a.country_code FROM company_addresses a WHERE a.workspace_id = c.workspace_id AND a.company_id = c.id AND a.is_primary LIMIT 1) AS "countryCode",
+          COALESCE((SELECT jsonb_agg(t.label ORDER BY t.normalized_label)
+                      FROM record_taxonomies rt JOIN taxonomy_terms t ON t.workspace_id = rt.workspace_id AND t.id = rt.taxonomy_term_id
+                     WHERE rt.workspace_id = c.workspace_id AND rt.record_id = c.id AND t.taxonomy = 'COMPANY_CATEGORY'), '[]'::jsonb) AS categories,
+          COALESCE((SELECT jsonb_agg(t.label ORDER BY t.normalized_label)
+                      FROM record_taxonomies rt JOIN taxonomy_terms t ON t.workspace_id = rt.workspace_id AND t.id = rt.taxonomy_term_id
+                     WHERE rt.workspace_id = c.workspace_id AND rt.record_id = c.id AND t.taxonomy = 'INDUSTRY'), '[]'::jsonb) AS industries
     FROM companies c JOIN records r USING (id, workspace_id)
    WHERE c.workspace_id = $1 AND r.archived_at IS NULL`
 
@@ -558,7 +608,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
 
   app.post('/api/v1/people', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const body = objectBody(request)
-    rejectUnknown(body, ['fullName', 'firstName', 'lastName', 'jobTitle', 'description', 'importance', 'email', 'phone', 'companyId', 'introducedByPersonId'])
+    rejectUnknown(body, ['fullName', 'firstName', 'lastName', 'jobTitle', 'description', 'importance', 'email', 'phone', 'city', 'companyId', 'introducedByPersonId'])
     let fullName: string
     if (has(body, 'fullName')) fullName = requiredText(body, 'fullName', 'fullName', 500)
     else fullName = [requiredText(body, 'firstName', 'firstName', 250), requiredText(body, 'lastName', 'lastName', 250)].join(' ').trim()
@@ -567,6 +617,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
     const importance = has(body, 'importance') ? numberValue(body.importance, 'importance', { min: 0, max: 5, integer: true, nullable: true }) : null
     const email = has(body, 'email') ? emailAddress(body.email) : null
     const phone = has(body, 'phone') ? normalizedPhone(body.phone) : null
+    const city = has(body, 'city') ? optionalText(body, 'city', 'city', 300) : null
     const companyId = has(body, 'companyId') ? uuid(body.companyId, 'companyId', true) : null
     const introducedBy = has(body, 'introducedByPersonId') ? uuid(body.introducedByPersonId, 'introducedByPersonId', true) : null
 
@@ -588,11 +639,15 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
         `INSERT INTO person_phones (workspace_id, person_id, raw_phone, e164, is_primary)
          VALUES ($1, $2, $3, $4, true)`, [user.workspaceId, record.id, phone.raw, phone.e164],
       )
+      if (city) await client.query(
+        `INSERT INTO person_addresses (workspace_id, person_id, city, is_primary) VALUES ($1, $2, $3, true)`,
+        [user.workspaceId, record.id, city],
+      )
       if (companyId) await client.query(
         `INSERT INTO person_companies (workspace_id, person_id, company_id, is_primary) VALUES ($1, $2, $3, true)`,
         [user.workspaceId, record.id, companyId],
       )
-      await writeActivity(client, user, request, 'PERSON_CREATED', record.id, ['fullName', ...(email ? ['email'] : []), ...(phone ? ['phone'] : []), ...(companyId ? ['companyId'] : [])], [companyId, introducedBy].filter((id): id is string => !!id))
+      await writeActivity(client, user, request, 'PERSON_CREATED', record.id, ['fullName', ...(email ? ['email'] : []), ...(phone ? ['phone'] : []), ...(city ? ['city'] : []), ...(companyId ? ['companyId'] : [])], [companyId, introducedBy].filter((id): id is string => !!id))
       const created = await client.query(`${PERSON_SELECT} AND p.id = $2`, [user.workspaceId, record.id])
       return { data: created.rows[0], version: record.version }
     })
@@ -611,7 +666,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
   app.patch('/api/v1/people/:id', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const id = recordId(request)
     const body = objectBody(request)
-    rejectUnknown(body, ['version', 'fullName', 'jobTitle', 'description', 'importance', 'email', 'phone', 'companyId', 'introducedByPersonId'])
+    rejectUnknown(body, ['version', 'fullName', 'jobTitle', 'description', 'importance', 'email', 'phone', 'city', 'companyId', 'introducedByPersonId'])
     const expected = expectedVersion(request, body)
     const columns: Array<{ column: string; value: unknown }> = []
     const changed: string[] = []
@@ -621,10 +676,12 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
     if (has(body, 'importance')) { columns.push({ column: 'importance', value: numberValue(body.importance, 'importance', { min: 0, max: 5, integer: true, nullable: true }) }); changed.push('importance') }
     const email = has(body, 'email') ? emailAddress(body.email) : undefined
     const phone = has(body, 'phone') ? normalizedPhone(body.phone) : undefined
+    const city = has(body, 'city') ? optionalText(body, 'city', 'city', 300) : undefined
     const companyId = has(body, 'companyId') ? uuid(body.companyId, 'companyId', true) : undefined
     const introducedBy = has(body, 'introducedByPersonId') ? uuid(body.introducedByPersonId, 'introducedByPersonId', true) : undefined
     if (email !== undefined) changed.push('email')
     if (phone !== undefined) changed.push('phone')
+    if (city !== undefined) changed.push('city')
     if (companyId !== undefined) changed.push('companyId')
     if (introducedBy !== undefined) { columns.push({ column: 'introduced_by_person_id', value: introducedBy }); changed.push('introducedByPersonId') }
     if (!changed.length) throw new HttpError(400, 'At least one field to update is required.')
@@ -638,6 +695,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
       await updateSubtype(client, 'people', user.workspaceId, id, columns)
       if (email !== undefined) await setPersonEmail(client, user.workspaceId, id, email)
       if (phone !== undefined) await setPersonPhone(client, user.workspaceId, id, phone)
+      if (city !== undefined) await setPrimaryAddressCity(client, 'person_addresses', 'person_id', user.workspaceId, id, city)
       if (companyId !== undefined) await setPersonCompany(client, user.workspaceId, id, companyId)
       await writeActivity(client, user, request, 'PERSON_UPDATED', id, changed, [companyId].filter((value): value is string => !!value))
       const updated = await client.query(`${PERSON_SELECT} AND p.id = $2`, [user.workspaceId, id])
@@ -662,7 +720,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
 
   app.post('/api/v1/companies', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const body = objectBody(request)
-    rejectUnknown(body, ['name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'website'])
+    rejectUnknown(body, ['name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'website', 'city'])
     const name = requiredText(body, 'name', 'name', 500)
     const description = has(body, 'description') ? optionalText(body, 'description', 'description', 20_000) : null
     const ownerUserId = has(body, 'ownerUserId') ? uuid(body.ownerUserId, 'ownerUserId', true) : null
@@ -670,6 +728,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
     const businessRole = has(body, 'businessRole') ? optionalText(body, 'businessRole', 'businessRole', 500) : null
     const domain = has(body, 'domain') ? normalizedDomain(body.domain) : null
     const website = has(body, 'website') ? canonicalWebsite(body.website) : null
+    const city = has(body, 'city') ? optionalText(body, 'city', 'city', 300) : null
     const result = await transaction(pool, async (client) => {
       await assertUser(client, user.workspaceId, ownerUserId)
       if (domain) await duplicateDomain(client, user.workspaceId, domain.normalized)
@@ -686,6 +745,10 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
       if (website) await client.query(
         `INSERT INTO company_links (workspace_id, company_id, kind, raw_url, canonical_url, is_primary) VALUES ($1, $2, 'WEBSITE', $3, $4, true)`,
         [user.workspaceId, record.id, website.raw, website.canonical],
+      )
+      if (city) await client.query(
+        `INSERT INTO company_addresses (workspace_id, company_id, city, is_primary) VALUES ($1, $2, $3, true)`,
+        [user.workspaceId, record.id, city],
       )
       await writeActivity(client, user, request, 'COMPANY_CREATED', record.id, ['name', ...(domain ? ['domain'] : []), ...(website ? ['website'] : [])])
       const created = await client.query(`${COMPANY_SELECT} AND c.id = $2`, [user.workspaceId, record.id])
@@ -706,7 +769,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
   app.patch('/api/v1/companies/:id', { preHandler: requireAuth }, protectedHandler(async (request, reply, user) => {
     const id = recordId(request)
     const body = objectBody(request)
-    rejectUnknown(body, ['version', 'name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'website'])
+    rejectUnknown(body, ['version', 'name', 'description', 'ownerUserId', 'customerProfile', 'businessRole', 'domain', 'website', 'city'])
     const expected = expectedVersion(request, body)
     const columns: Array<{ column: string; value: unknown }> = []
     const changed: string[] = []
@@ -717,8 +780,10 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
     if (has(body, 'businessRole')) { columns.push({ column: 'business_role', value: optionalText(body, 'businessRole', 'businessRole', 500) }); changed.push('businessRole') }
     const domain = has(body, 'domain') ? normalizedDomain(body.domain) : undefined
     const website = has(body, 'website') ? canonicalWebsite(body.website) : undefined
+    const city = has(body, 'city') ? optionalText(body, 'city', 'city', 300) : undefined
     if (domain !== undefined) changed.push('domain')
     if (website !== undefined) changed.push('website')
+    if (city !== undefined) changed.push('city')
     if (!changed.length) throw new HttpError(400, 'At least one field to update is required.')
     const ownerUserId = columns.find((column) => column.column === 'owner_user_id')?.value as string | null | undefined
     const result = await transaction(pool, async (client) => {
@@ -748,6 +813,7 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
           await client.query("INSERT INTO company_links (workspace_id, company_id, kind, raw_url, canonical_url, is_primary) VALUES ($1, $2, 'WEBSITE', $3, $4, true)", [user.workspaceId, id, website.raw, website.canonical])
         }
       }
+      if (city !== undefined) await setPrimaryAddressCity(client, 'company_addresses', 'company_id', user.workspaceId, id, city)
       await writeActivity(client, user, request, 'COMPANY_UPDATED', id, changed)
       const updated = await client.query(`${COMPANY_SELECT} AND c.id = $2`, [user.workspaceId, id])
       return { data: updated.rows[0], version }
@@ -1012,7 +1078,39 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
          FROM records WHERE workspace_id = $1 AND archived_at IS NULL`,
       [user.workspaceId],
     )
-    const activity = await pool.query(
+    const [followUpCount, actionItems, activity] = await Promise.all([
+      pool.query<{ count: number }>(
+        `SELECT count(*)::integer AS count FROM follow_ups WHERE workspace_id = $1 AND status = 'OPEN'`,
+        [user.workspaceId],
+      ),
+      pool.query(
+        `SELECT actions.id, actions.title, actions.description, actions."dueAt", actions.status, actions.href
+           FROM (
+             SELECT mn.note_id AS id, e.title || ' — meeting notes required' AS title,
+                    'Add the summary and next steps for this meeting.'::text AS description,
+                    e.starts_at AS "dueAt", mn.status, '/meeting-notes'::text AS href
+               FROM meeting_notes mn JOIN events e ON e.workspace_id = mn.workspace_id AND e.id = mn.event_id
+              WHERE mn.workspace_id = $1 AND mn.status = 'REQUIRED'
+             UNION ALL
+             SELECT f.id, f.title, COALESCE(f.body, 'Follow-up action') AS description,
+                    f.due_at AS "dueAt", f.status, '/follow-ups'::text AS href
+               FROM follow_ups f WHERE f.workspace_id = $1 AND f.status = 'OPEN'
+             UNION ALL
+             SELECT step.id AS id,
+                    'Warm introduction step'::text AS title,
+                    target.full_name || ' — waiting on ' || person.full_name AS description,
+                    step.follow_up_at AS "dueAt", step.status, '/introductions'::text AS href
+               FROM introduction_steps step
+               JOIN introduction_chains chain ON chain.workspace_id = step.workspace_id AND chain.id = step.chain_id
+               JOIN people target ON target.workspace_id = chain.workspace_id AND target.id = chain.target_person_id
+               JOIN people person ON person.workspace_id = step.workspace_id AND person.id = step.to_person_id
+              WHERE step.workspace_id = $1 AND chain.status = 'ACTIVE'
+                AND step.status NOT IN ('INTRODUCED', 'COMPLETED', 'DECLINED', 'CANCELLED', 'SKIPPED')
+           ) AS actions
+          ORDER BY actions."dueAt" NULLS LAST, actions.id LIMIT 20`,
+        [user.workspaceId],
+      ),
+      pool.query(
       `SELECT ae.id, ae.action AS title, ae.action AS description, ae.occurred_at AS "occurredAt",
               a.display_name AS "actorName", r.record_type AS "recordType", ae.primary_record_id AS "recordId",
               COALESCE(p.full_name, c.name, o.name, n.title) AS "recordName"
@@ -1026,8 +1124,9 @@ export function registerCrmRoutes(app: FastifyInstance, { pool }: CrmOptions): v
         WHERE ae.workspace_id = $1
         ORDER BY ae.occurred_at DESC, ae.id DESC LIMIT 10`,
       [user.workspaceId],
-    )
-    const summary = { ...counts.rows[0], openFollowUps: 0 }
-    return reply.send({ summary, metrics: summary, actionItems: [], recentActivity: activity.rows })
+      ),
+    ])
+    const summary = { ...counts.rows[0], openFollowUps: followUpCount.rows[0]?.count ?? 0 }
+    return reply.send({ summary, metrics: summary, actionItems: actionItems.rows, recentActivity: activity.rows })
   }))
 }

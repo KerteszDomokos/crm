@@ -1,4 +1,12 @@
-import type { DashboardData, SearchResult, UserIdentity } from './types'
+import type {
+  DashboardData,
+  EventRecord,
+  FollowUpRecord,
+  MeetingNoteRequirementRecord,
+  SearchResult,
+  UserIdentity,
+  WarmIntroductionRecord,
+} from './types'
 
 export const API_ROOT = (import.meta.env.VITE_API_ROOT ?? '/api/v1').replace(/\/$/, '')
 
@@ -115,6 +123,26 @@ export const api = {
   update: <T,>(resource: string, id: string, body: Record<string, unknown>) =>
     request<T>(`/${resource}/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }, true).then((payload) => unwrapObject<T>(payload)),
   get: <T,>(resource: string, id: string) => request<unknown>(`/${resource}/${encodeURIComponent(id)}`).then((payload) => unwrapObject<T>(payload)),
+  listEvents: () => request<unknown>('/events?limit=50').then(unwrapList<EventRecord>),
+  createEvent: (body: Record<string, unknown>) =>
+    request<unknown>('/events', { method: 'POST', body: JSON.stringify(body) }, true).then(unwrapObject<EventRecord>),
+  listFollowUps: () => request<unknown>('/follow-ups?limit=50').then(unwrapList<FollowUpRecord>),
+  createFollowUp: (body: Record<string, unknown>) =>
+    request<unknown>('/follow-ups', { method: 'POST', body: JSON.stringify(body) }, true).then(unwrapObject<FollowUpRecord>),
+  updateFollowUp: (id: string, body: Record<string, unknown>) =>
+    request<unknown>(`/follow-ups/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }, true).then(unwrapObject<FollowUpRecord>),
+  listIntroductions: () => request<unknown>('/introductions?limit=50').then(unwrapList<WarmIntroductionRecord>),
+  createIntroduction: (body: Record<string, unknown>) =>
+    request<unknown>('/introductions', { method: 'POST', body: JSON.stringify(body) }, true).then(unwrapObject<WarmIntroductionRecord>),
+  updateIntroduction: (id: string, body: Record<string, unknown>) =>
+    request<unknown>(`/introductions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }, true).then(unwrapObject<WarmIntroductionRecord>),
+  listMeetingNotes: () => request<unknown>('/meeting-notes?limit=50').then(unwrapList<MeetingNoteRequirementRecord>),
+  createMeetingNote: (body: { eventId: string; title?: string }) =>
+    request<unknown>('/meeting-notes', { method: 'POST', body: JSON.stringify(body) }, true).then(unwrapObject<MeetingNoteRequirementRecord>),
+  completeMeetingNote: (id: string, body: { summary: string; nextStepsMarkdown?: string; followUpDate?: string }) =>
+    request<unknown>(`/meeting-notes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ ...body, status: 'COMPLETED' }) }, true).then(unwrapObject<MeetingNoteRequirementRecord>),
+  cancelMeetingNote: (id: string, reason: string) =>
+    request<unknown>(`/meeting-notes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ status: 'CANCELLED', cancellationReason: reason }) }, true).then(unwrapObject<MeetingNoteRequirementRecord>),
   dashboard: async () => unwrapObject<DashboardData>(await request<unknown>('/dashboard')),
   search: async (query: string) => {
     const params = new URLSearchParams({ q: query, limit: '8' })

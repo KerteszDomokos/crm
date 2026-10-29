@@ -3,9 +3,12 @@ import {
   ArrowLeft,
   ArrowUpRight,
   Building2,
+  CalendarDays,
   Check,
+  ClipboardCheck,
   ChevronDown,
   CircleHelp,
+  GitBranch,
   Clock3,
   FileText,
   LayoutDashboard,
@@ -15,6 +18,8 @@ import {
   Plus,
   Search,
   ShieldCheck,
+  ListChecks,
+  MapPin,
   UsersRound,
   X,
   BriefcaseBusiness,
@@ -24,12 +29,16 @@ import { api, ApiError, recordPath, type AdminUser } from './api'
 import type {
   CompanyRecord,
   DashboardData,
+  EventRecord,
+  FollowUpRecord,
+  MeetingNoteRequirementRecord,
   NoteRecord,
   OpportunityRecord,
   OpportunityStage,
   PersonRecord,
   SearchResult,
   UserIdentity,
+  WarmIntroductionRecord,
 } from './types'
 
 type ResourceDefinition<T> = {
@@ -157,7 +166,7 @@ function ResourcePage<T extends { id: string }>({ definition }: { definition: Re
   </section>
 }
 
-function RecordFormDialog({ definition, record, onClose, onSaved }: { definition: ResourceFormDefinition; record?: Record<string, unknown>; onClose: () => void; onSaved: () => void }) {
+function RecordFormDialog({ definition, record, onClose, onSaved, save }: { definition: ResourceFormDefinition; record?: Record<string, unknown>; onClose: () => void; onSaved: () => void; save?: (values: Record<string, unknown>) => Promise<unknown> }) {
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -167,12 +176,18 @@ function RecordFormDialog({ definition, record, onClose, onSaved }: { definition
     setPending(true)
     const form = new FormData(event.currentTarget)
     const values: Record<string, unknown> = {}
+    if (record && typeof record.version === 'number') values.version = record.version
     definition.fields.forEach((field) => {
       const value = form.get(field.name)?.toString().trim()
-      if (value) values[field.name] = field.type === 'number' ? Number(value) : value
+      if (value) {
+        if (field.type === 'number') values[field.name] = Number(value)
+        else if (field.type === 'datetime-local') values[field.name] = workspaceDateTimeToIso(value)
+        else values[field.name] = value
+      }
     })
     try {
-      if (record?.id) await api.update(definition.resource, String(record.id), values)
+      if (save) await save(values)
+      else if (record?.id) await api.update(definition.resource, String(record.id), values)
       else await api.create(definition.resource, values)
       onSaved()
     } catch (reason) {
@@ -198,7 +213,14 @@ function RecordFormDialog({ definition, record, onClose, onSaved }: { definition
 function fieldInitialValue(name: string, record?: Record<string, unknown>) {
   if (!record) return ''
   const value = record[name]
-  if (value != null) return name === 'expectedCloseDate' ? String(value).slice(0, 10) : String(value)
+  if (value != null) {
+    if (name === 'expectedCloseDate' || name === 'followUpDate' || name === 'dueAt') return String(value).slice(0, 10)
+    if (name === 'startAt' || name === 'endAt') {
+      const date = new Date(String(value))
+      return Number.isNaN(date.getTime()) ? String(value) : new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16)
+    }
+    return String(value)
+  }
   if (name === 'email') {
     const emails = record.emails
     if (Array.isArray(emails) && emails.length) {
@@ -291,11 +313,363 @@ const notesDefinition: ResourceDefinition<NoteRecord> = {
   ],
 }
 
+const eventFormDefinition: ResourceFormDefinition = {
+  resource: 'events', singular: 'Event', fields: [
+    { name: 'title', label: 'Event title', required: true, placeholder: 'A conversation worth remembering' },
+    { name: 'startAt', label: 'Starts', type: 'datetime-local', required: true },
+    { name: 'endAt', label: 'Ends', type: 'datetime-local', required: true },
+    { name: 'location', label: 'Location', placeholder: 'Office, city, or venue' },
+    { name: 'meetingUrl', label: 'Meeting link', type: 'url', placeholder: 'https://…' },
+    { name: 'description', label: 'Description', type: 'textarea', placeholder: 'What is this event about?' },
+  ],
+}
+
+const followUpFormDefinition: ResourceFormDefinition = {
+  resource: 'follow-ups', singular: 'Follow-up', fields: [
+    { name: 'title', label: 'Follow-up', required: true, placeholder: 'Send the proposal' },
+    { name: 'dueAt', label: 'Due', type: 'datetime-local', required: true },
+    { name: 'assigneeUserId', label: 'Assignee user ID', placeholder: 'Optional workspace member ID' },
+    { name: 'body', label: 'Details', type: 'textarea', placeholder: 'Context or next step' },
+  ],
+}
+
+function useWorkflowResource<T>(loader: () => Promise<T[]>) {
+  const [records, setRecords] = useState<T[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [refreshToken, setRefreshToken] = useState(0)
+  const reload = useCallback(() => setRefreshToken((value) => value + 1), [])
+
+  useEffect(() => {
+    let active = true
+    setLoading(true)
+    setError(null)
+    loader().then((result) => { if (active) setRecords(result) }).catch((reason: unknown) => {
+      if (active) setError(reason instanceof Error ? reason.message : 'Unable to load this workflow.')
+    }).finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [loader, refreshToken])
+
+  return { records, loading, error, reload }
+}
+
+function WorkflowListPanel({
+  title, icon: Icon, count, loading, error, onRetry, emptyTitle, emptyDescription, emptyAction, children,
+}: {
+  title: string
+  icon: typeof CalendarDays
+  count: number
+  loading: boolean
+  error: string | null
+  onRetry: () => void
+  emptyTitle: string
+  emptyDescription: string
+  emptyAction?: ReactNode
+  children: ReactNode
+}) {
+  return <div className="list-panel workflow-list-panel">
+    <div className="list-toolbar"><div className="list-context"><span className="list-icon"><Icon size={16} /></span><div><strong>{title}</strong><span>{loading ? 'Loading…' : `${count} ${count === 1 ? 'record' : 'records'}`}</span></div></div></div>
+    {loading ? <LoadingState label={`Loading ${title.toLowerCase()}…`} /> : error ? <ErrorState message={error} onRetry={onRetry} /> : count === 0 ? <EmptyState icon={Icon} title={emptyTitle} description={emptyDescription} action={emptyAction} /> : <div className="workflow-cards">{children}</div>}
+  </div>
+}
+
+function formatDateTime(value?: string | null) {
+  if (!value) return 'Date not set'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }).format(date)
+}
+
+function workspaceDateTimeToIso(value: string) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value)
+  if (!match) throw new Error('Enter a valid date and time.')
+  const desired = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]))
+  let instant = desired
+  const formatter = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/Budapest', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  })
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = Object.fromEntries(formatter.formatToParts(new Date(instant)).map((part) => [part.type, part.value]))
+    const represented = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute))
+    instant -= represented - desired
+  }
+  const check = Object.fromEntries(formatter.formatToParts(new Date(instant)).map((part) => [part.type, part.value]))
+  if (
+    Number(check.year) !== Number(match[1]) || Number(check.month) !== Number(match[2]) ||
+    Number(check.day) !== Number(match[3]) || Number(check.hour) !== Number(match[4]) ||
+    Number(check.minute) !== Number(match[5])
+  ) throw new Error('That local time does not exist in the workspace timezone. Choose another time.')
+  return new Date(instant).toISOString()
+}
+
+function statusText(value?: string | null) {
+  if (!value) return 'Open'
+  return value.toLowerCase().replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function statusClass(value?: string | null) {
+  return (value ?? 'open').toLowerCase().replaceAll('_', '-')
+}
+
+function workflowRelated(records?: Array<{ name?: string; type?: string }>, fallback?: string | null) {
+  return records?.map((record) => record.name).filter(Boolean).join(', ') || fallback || 'No related record'
+}
+
+function EventsPage() {
+  const { records, loading, error, reload } = useWorkflowResource<EventRecord>(api.listEvents)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [meetingNotePending, setMeetingNotePending] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+
+  async function createMeetingNote(record: EventRecord) {
+    setActionError(null)
+    setMeetingNotePending(record.id)
+    try {
+      await api.createMeetingNote({ eventId: record.id, title: `Meeting notes — ${record.title ?? 'Meeting'}` })
+      reload()
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Unable to create a meeting-note requirement.')
+    } finally {
+      setMeetingNotePending(null)
+    }
+  }
+
+  return <section className="page-stack">
+    <div className="page-heading"><div><div className="eyebrow page-eyebrow">WORKSPACE / CALENDAR</div><h1>Events</h1><p>Create local events and keep dates, locations, and meeting links close to your relationships.</p></div><button type="button" className="button button-primary" onClick={() => setCreateOpen(true)}><Plus size={16} />Add event</button></div>
+    {actionError && <div className="form-error" role="alert">{actionError}</div>}
+    <WorkflowListPanel title="Events" icon={CalendarDays} count={records.length} loading={loading} error={error} onRetry={reload} emptyTitle="No events yet" emptyDescription="Add a local event or connect a calendar to keep meetings in view." emptyAction={<button type="button" className="button button-primary" onClick={() => setCreateOpen(true)}><Plus size={15} />Add event</button>}>
+      {records.map((record) => {
+        const startAt = record.startAt ?? record.startsAt ?? record.start
+        const endAt = record.endAt ?? record.endsAt ?? record.end
+        const attendees = Array.isArray(record.attendees) ? record.attendees.map((attendee) => typeof attendee === 'string' ? attendee : attendee.name ?? attendee.email).filter(Boolean) : []
+        const canRequestNote = !!endAt && Date.parse(endAt) <= Date.now() && record.status !== 'CANCELLED' && record.workflowEligible !== false && !record.meetingNoteStatus
+        return <article className="workflow-card" key={record.id}>
+          <div className="workflow-card-heading"><div><span className="eyebrow">{record.source ? statusText(record.source) : 'LOCAL EVENT'}</span><h3>{record.title ?? 'Untitled event'}</h3></div><span className={`workflow-status ${statusClass(record.status)}`}>{statusText(record.status ?? (record.workflowEligible === false ? 'EXCLUDED' : 'SCHEDULED'))}</span></div>
+          <p className="workflow-description">{record.description || 'No event description added.'}</p>
+          <div className="workflow-card-meta"><span><Clock3 size={13} />{formatDateTime(startAt)}{endAt ? ` – ${formatDateTime(endAt)}` : ''}</span>{record.location && <span><MapPin size={13} />{record.location}</span>}{attendees.length > 0 && <span><UsersRound size={13} />{attendees.join(', ')}</span>}{record.meetingUrl && <a href={record.meetingUrl} target="_blank" rel="noreferrer"><ArrowUpRight size={13} />Join meeting</a>}</div>
+          {record.exclusionReason && <p className="workflow-note">Note workflow excluded: {record.exclusionReason}</p>}
+          {canRequestNote && <div className="workflow-card-actions"><button type="button" className="button button-ghost button-small" disabled={meetingNotePending === record.id} onClick={() => void createMeetingNote(record)}>{meetingNotePending === record.id ? <LoaderCircle size={13} className="spin" /> : <ClipboardCheck size={13} />}Create meeting-note requirement</button></div>}
+          {record.meetingNoteStatus && <p className="workflow-note">Meeting note: {statusText(record.meetingNoteStatus)}</p>}
+        </article>
+      })}
+    </WorkflowListPanel>
+    {createOpen && <RecordFormDialog definition={eventFormDefinition} save={api.createEvent} onClose={() => setCreateOpen(false)} onSaved={() => { setCreateOpen(false); reload() }} />}
+  </section>
+}
+
+function FollowUpsPage() {
+  const { records, loading, error, reload } = useWorkflowResource<FollowUpRecord>(api.listFollowUps)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [pendingId, setPendingId] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+
+  async function changeStatus(record: FollowUpRecord, status: 'COMPLETED' | 'CANCELLED') {
+    setActionError(null)
+    setPendingId(record.id)
+    try {
+      await api.updateFollowUp(record.id, { status })
+      reload()
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Unable to update this follow-up.')
+    } finally {
+      setPendingId(null)
+    }
+  }
+
+  const openCount = records.filter((record) => !['COMPLETED', 'CANCELLED'].includes((record.status ?? 'OPEN').toUpperCase())).length
+  return <section className="page-stack">
+    <div className="page-heading"><div><div className="eyebrow page-eyebrow">WORKSPACE / ACTIONS</div><h1>Follow-ups</h1><p>Make the next relationship-building action clear, assigned, and easy to close out.</p></div><button type="button" className="button button-primary" onClick={() => setCreateOpen(true)}><Plus size={16} />Add follow-up</button></div>
+    {actionError && <div className="form-error" role="alert">{actionError}</div>}
+    <div className="workflow-summary"><span className="workflow-summary-icon"><ListChecks size={16} /></span><span><strong>{openCount}</strong> open action{openCount === 1 ? '' : 's'} need attention</span></div>
+    <WorkflowListPanel title="Follow-ups" icon={ListChecks} count={records.length} loading={loading} error={error} onRetry={reload} emptyTitle="You’re all caught up" emptyDescription="Create a follow-up to make sure an important next step does not get lost." emptyAction={<button type="button" className="button button-primary" onClick={() => setCreateOpen(true)}><Plus size={15} />Add follow-up</button>}>
+      {records.map((record) => {
+        const dueAt = record.dueAt
+        const isOpen = !['COMPLETED', 'CANCELLED'].includes((record.status ?? 'OPEN').toUpperCase())
+        const overdue = isOpen && dueAt != null && new Date(dueAt).getTime() < Date.now()
+        const related = workflowRelated(record.relatedRecords, record.personName ?? record.companyName ?? record.opportunityName)
+        return <article className={`workflow-card ${overdue ? 'workflow-card-overdue' : ''}`} key={record.id}>
+          <div className="workflow-card-heading"><div><span className="eyebrow">{record.source ? statusText(record.source) : 'FOLLOW-UP'}</span><h3>{record.title ?? 'Untitled follow-up'}</h3></div><span className={`workflow-status ${statusClass(overdue ? 'OVERDUE' : record.status)}`}>{overdue ? 'Overdue' : statusText(record.status)}</span></div>
+          {record.body && <p className="workflow-description">{record.body}</p>}
+          <div className="workflow-card-meta"><span><Clock3 size={13} />Due {formatDateTime(dueAt)}</span><span><UsersRound size={13} />{related}</span>{(record.assigneeName ?? record.assigneeUserId) && <span>Assigned to {record.assigneeName ?? record.assigneeUserId}</span>}</div>
+          {isOpen && <div className="workflow-card-actions"><button type="button" className="button button-ghost button-small" disabled={pendingId === record.id} onClick={() => void changeStatus(record, 'COMPLETED')}>{pendingId === record.id ? <LoaderCircle size={13} className="spin" /> : <Check size={13} />}Complete</button><button type="button" className="button button-ghost button-small danger-action" disabled={pendingId === record.id} onClick={() => void changeStatus(record, 'CANCELLED')}>Cancel</button></div>}
+        </article>
+      })}
+    </WorkflowListPanel>
+    {createOpen && <RecordFormDialog definition={followUpFormDefinition} save={api.createFollowUp} onClose={() => setCreateOpen(false)} onSaved={() => { setCreateOpen(false); reload() }} />}
+  </section>
+}
+
+function IntroductionFormDialog({ people, peopleLoading, onClose, onSaved }: { people: PersonRecord[]; peopleLoading: boolean; onClose: () => void; onSaved: () => void }) {
+  const [stepCount, setStepCount] = useState(1)
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setError(null)
+    const form = new FormData(event.currentTarget)
+    const targetPersonId = String(form.get('targetPersonId') ?? '').trim()
+    const steps = Array.from({ length: stepCount }, (_, index) => {
+      const fromPersonId = String(form.get(`steps.${index}.fromPersonId`) ?? '').trim()
+      const toPersonId = String(form.get(`steps.${index}.toPersonId`) ?? '').trim()
+      const responsibleUserId = String(form.get(`steps.${index}.responsibleUserId`) ?? '').trim()
+      const notes = String(form.get(`steps.${index}.notes`) ?? '').trim()
+      const followUpDate = String(form.get(`steps.${index}.followUpAt`) ?? '').trim()
+      const followUpAt = followUpDate ? workspaceDateTimeToIso(`${followUpDate}T12:00`) : undefined
+      return { position: index + 1, ...(fromPersonId ? { fromPersonId } : {}), toPersonId, ...(responsibleUserId ? { responsibleUserId } : {}), status: 'PENDING', ...(notes ? { notes } : {}), ...(followUpAt ? { followUpAt } : {}) }
+    })
+    if (steps.some((step) => !step.toPersonId)) { setError('Add a destination person ID for each step.'); return }
+    setPending(true)
+    try {
+      await api.createIntroduction({ targetPersonId, ...(String(form.get('ownerUserId') ?? '').trim() ? { ownerUserId: String(form.get('ownerUserId')).trim() } : {}), steps })
+      onSaved()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to create this introduction.')
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal workflow-modal" role="dialog" aria-modal="true" aria-labelledby="intro-form-title">
+    <div className="modal-header"><div><div className="eyebrow">RELATIONSHIP DEVELOPMENT</div><h2 id="intro-form-title">Plan a warm introduction</h2></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={16} /></button></div>
+    <form className="form-body" onSubmit={submit}>
+      <p className="dialog-hint">Build an ordered path through people in your CRM. The first step can start with your team.</p>
+      <div className="form-grid"><label className="form-field"><span>Target person <b className="required-mark"> *</b></span><select name="targetPersonId" required disabled={peopleLoading || people.length === 0}><option value="">{peopleLoading ? 'Loading people…' : people.length ? 'Choose a person' : 'No people available'}</option>{people.map((person) => <option key={person.id} value={person.id}>{personName(person)}</option>)}</select></label><label className="form-field"><span>Chain owner user ID</span><input name="ownerUserId" placeholder="Optional workspace member ID" /></label></div>
+      {!peopleLoading && people.length === 0 && <p className="dialog-hint">Add a person before planning an introduction. <Link to="/people" className="one-time-link-open">Open people</Link></p>}
+      {Array.from({ length: stepCount }, (_, index) => <fieldset className="intro-step" key={index}><legend>Step {index + 1}</legend><div className="form-grid"><label className="form-field"><span>Introducer{index === 0 ? ' (leave blank for team)' : ''}</span><select name={`steps.${index}.fromPersonId`} defaultValue=""><option value="">{index === 0 ? 'Your team' : 'Choose a person (optional)'}</option>{people.map((person) => <option key={person.id} value={person.id}>{personName(person)}</option>)}</select></label><label className="form-field"><span>Next person <b className="required-mark"> *</b></span><select name={`steps.${index}.toPersonId`} required disabled={peopleLoading || people.length === 0}><option value="">Choose a person</option>{people.map((person) => <option key={person.id} value={person.id}>{personName(person)}</option>)}</select></label><label className="form-field"><span>Responsible member ID</span><input name={`steps.${index}.responsibleUserId`} placeholder="Optional workspace member ID" /></label><label className="form-field"><span>Follow-up date</span><input name={`steps.${index}.followUpAt`} type="date" /></label></div><label className="form-field"><span>Step notes</span><textarea name={`steps.${index}.notes`} rows={2} placeholder="Context or the ask for this introduction" /></label></fieldset>)}
+      <button type="button" className="button button-ghost button-small add-step-button" disabled={stepCount >= 5} onClick={() => setStepCount((count) => Math.min(5, count + 1))}><Plus size={13} />Add another step</button>
+      {error && <div className="form-error" role="alert">{error}</div>}
+      <div className="modal-actions"><button type="button" className="button button-ghost" onClick={onClose} disabled={pending}>Cancel</button><button type="submit" className="button button-primary" disabled={pending}>{pending ? <LoaderCircle size={15} className="spin" /> : <GitBranch size={15} />}Create introduction</button></div>
+    </form>
+  </section></div>
+}
+
+function IntroductionsPage() {
+  const { records, loading, error, reload } = useWorkflowResource<WarmIntroductionRecord>(api.listIntroductions)
+  const people = useResource<PersonRecord>('people')
+  const peopleById = useMemo(() => new Map(people.records.map((person) => [person.id, personName(person)])), [people.records])
+  const [createOpen, setCreateOpen] = useState(false)
+  const [pendingStep, setPendingStep] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+
+  async function updateStep(record: WarmIntroductionRecord, step: NonNullable<WarmIntroductionRecord['steps']>[number], nextStatus: 'REQUESTED' | 'INTRODUCED') {
+    const stepKey = `${record.id}-${step.id ?? step.position ?? ''}`
+    setPendingStep(stepKey)
+    setActionError(null)
+    const updatedSteps = (record.steps ?? []).map((item, index) => ({
+      ...(item.id ? { id: item.id } : {}),
+      position: item.position ?? index + 1,
+      fromPersonId: item.fromPersonId ?? null,
+      toPersonId: item.toPersonId ?? '',
+      responsibleUserId: item.responsibleUserId ?? null,
+      responsiblePersonId: item.responsiblePersonId ?? null,
+      status: item.id === step.id ? nextStatus : item.status ?? 'PENDING',
+      notes: item.notes ?? null,
+      requestedAt: item.requestedAt ?? null,
+      followUpAt: item.followUpAt ?? null,
+    }))
+    const allTerminal = updatedSteps.every((item) => ['INTRODUCED', 'COMPLETED', 'DECLINED', 'CANCELLED', 'SKIPPED'].includes(item.status.toUpperCase()))
+    try {
+      await api.updateIntroduction(record.id, { steps: updatedSteps, ...(allTerminal ? { status: 'COMPLETED' } : {}) })
+      reload()
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : 'Unable to update this introduction step.')
+    } finally {
+      setPendingStep(null)
+    }
+  }
+
+  return <section className="page-stack">
+    <div className="page-heading"><div><div className="eyebrow page-eyebrow">WORKSPACE / RELATIONSHIPS</div><h1>Warm introductions</h1><p>Map the people who can open the next door, one clear step at a time.</p></div><button type="button" className="button button-primary" onClick={() => setCreateOpen(true)}><Plus size={16} />Plan introduction</button></div>
+    {actionError && <div className="form-error" role="alert">{actionError}</div>}
+    <WorkflowListPanel title="Introduction chains" icon={GitBranch} count={records.length} loading={loading} error={error} onRetry={reload} emptyTitle="No introduction chains yet" emptyDescription="Create a path through your network and make each person’s next action visible." emptyAction={<button type="button" className="button button-primary" onClick={() => setCreateOpen(true)}><Plus size={15} />Plan introduction</button>}>
+      {records.map((record) => {
+        const steps = Array.isArray(record.steps) ? [...record.steps].sort((left, right) => (left.position ?? 0) - (right.position ?? 0)) : []
+        return <article className="workflow-card" key={record.id}>
+          <div className="workflow-card-heading"><div><span className="eyebrow">INTRODUCTION CHAIN</span><h3>{record.targetPersonName ?? (record.targetPersonId ? peopleById.get(record.targetPersonId) ?? `Target · ${record.targetPersonId}` : 'Target person not set')}</h3></div><span className={`workflow-status ${statusClass(record.status)}`}>{statusText(record.status ?? 'ACTIVE')}</span></div>
+          <p className="workflow-intro-owner">{record.ownerName ? `Owned by ${record.ownerName}` : record.ownerUserId ? `Owner · ${record.ownerUserId}` : 'Shared relationship workflow'}{record.currentStep ? ` · Current step ${record.currentStep}` : ''}</p>
+          {steps.length ? <ol className="intro-path">{steps.map((step, index) => {
+            const stepKey = `${record.id}-${step.id ?? step.position ?? ''}`
+            const stepStatus = (step.status ?? 'PENDING').toUpperCase()
+            return <li key={step.id ?? `${record.id}-${step.position ?? index}`}><span className="intro-step-number">{step.position ?? index + 1}</span><div className="intro-step-copy"><strong>{step.fromPersonName ?? (step.fromPersonId ? peopleById.get(step.fromPersonId) ?? `Person · ${step.fromPersonId}` : 'Your team')} <ArrowUpRight size={12} /> {step.toPersonName ?? (step.toPersonId ? peopleById.get(step.toPersonId) ?? `Person · ${step.toPersonId}` : 'Next person')}</strong><small>{step.notes || (step.followUpAt ? `Follow up ${formatDate(step.followUpAt)}` : 'No step notes')}</small></div><span className={`workflow-status ${statusClass(step.status)}`}>{statusText(step.status ?? 'PENDING')}</span>{stepStatus === 'PENDING' && <button type="button" className="button button-ghost button-small intro-step-action" disabled={pendingStep === stepKey} onClick={() => void updateStep(record, step, 'REQUESTED')}>{pendingStep === stepKey ? <LoaderCircle size={12} className="spin" /> : null}Request intro</button>}{stepStatus === 'REQUESTED' && <button type="button" className="button button-ghost button-small intro-step-action" disabled={pendingStep === stepKey} onClick={() => void updateStep(record, step, 'INTRODUCED')}>{pendingStep === stepKey ? <LoaderCircle size={12} className="spin" /> : <Check size={12} />}Mark introduced</button>}</li>
+          })}</ol> : <p className="workflow-note">No steps have been added to this chain yet.</p>}
+        </article>
+      })}
+    </WorkflowListPanel>
+    {createOpen && <IntroductionFormDialog people={people.records} peopleLoading={people.loading} onClose={() => setCreateOpen(false)} onSaved={() => { setCreateOpen(false); reload() }} />}
+  </section>
+}
+
+function MeetingNoteActionDialog({ record, mode, onClose, onSaved }: { record: MeetingNoteRequirementRecord; mode: 'complete' | 'cancel'; onClose: () => void; onSaved: () => void }) {
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setError(null)
+    const form = new FormData(event.currentTarget)
+    setPending(true)
+    try {
+      if (mode === 'complete') {
+        await api.completeMeetingNote(record.id, {
+          summary: String(form.get('summary') ?? '').trim(),
+          nextStepsMarkdown: String(form.get('nextStepsMarkdown') ?? '').trim() || undefined,
+          followUpDate: String(form.get('followUpDate') ?? '').trim() || undefined,
+        })
+      } else {
+        await api.cancelMeetingNote(record.id, String(form.get('reason') ?? '').trim())
+      }
+      onSaved()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to update this meeting note.')
+    } finally {
+      setPending(false)
+    }
+  }
+  const title = record.eventTitle ?? record.title ?? 'Meeting note'
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="meeting-note-action-title">
+    <div className="modal-header"><div><div className="eyebrow">{mode === 'complete' ? 'MEETING RECAP' : 'CANCEL REQUIREMENT'}</div><h2 id="meeting-note-action-title">{mode === 'complete' ? 'Complete meeting note' : 'Cancel meeting note'}</h2><p className="dialog-hint">{title}</p></div><button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog"><X size={16} /></button></div>
+    <form className="form-body" onSubmit={submit}>
+      {mode === 'complete' ? <><label className="form-field"><span>Meeting summary <b className="required-mark"> *</b></span><textarea name="summary" rows={4} required defaultValue={record.summary ?? ''} placeholder="What was discussed?" /></label><label className="form-field"><span>Next steps</span><textarea name="nextStepsMarkdown" rows={3} defaultValue={record.nextStepsMarkdown ?? ''} placeholder="Actions, owners, and decisions" /></label><label className="form-field"><span>Follow-up date</span><input name="followUpDate" type="date" defaultValue={record.followUpDate?.slice(0, 10) ?? ''} /></label></> : <label className="form-field"><span>Cancellation reason <b className="required-mark"> *</b></span><textarea name="reason" rows={3} required placeholder="Why is this note no longer required?" /></label>}
+      {error && <div className="form-error" role="alert">{error}</div>}
+      <div className="modal-actions"><button type="button" className="button button-ghost" onClick={onClose} disabled={pending}>Keep open</button><button type="submit" className={`button ${mode === 'complete' ? 'button-primary' : 'button-ghost danger-action'}`} disabled={pending}>{pending ? <LoaderCircle size={15} className="spin" /> : mode === 'complete' ? <Check size={15} /> : null}{mode === 'complete' ? 'Complete note' : 'Cancel requirement'}</button></div>
+    </form>
+  </section></div>
+}
+
+function MeetingNotesPage() {
+  const { records, loading, error, reload } = useWorkflowResource<MeetingNoteRequirementRecord>(api.listMeetingNotes)
+  const [action, setAction] = useState<{ record: MeetingNoteRequirementRecord; mode: 'complete' | 'cancel' } | null>(null)
+  const outstanding = records.filter((record) => !['COMPLETED', 'CANCELLED'].includes((record.status ?? 'REQUIRED').toUpperCase())).length
+  return <section className="page-stack">
+    <div className="page-heading"><div><div className="eyebrow page-eyebrow">WORKSPACE / MEETING WORKFLOW</div><h1>Meeting-note requirements</h1><p>Required recaps for eligible meetings. Complete the summary and next steps, or record why a note is no longer needed.</p></div></div>
+    <div className="workflow-summary"><span className="workflow-summary-icon"><ClipboardCheck size={16} /></span><span><strong>{outstanding}</strong> note{outstanding === 1 ? '' : 's'} still required</span></div>
+    <WorkflowListPanel title="Meeting notes" icon={ClipboardCheck} count={records.length} loading={loading} error={error} onRetry={reload} emptyTitle="No meeting notes required" emptyDescription="Required notes appear here after eligible meetings. Calendar exclusions prevent unnecessary reminders.">
+      {records.map((record) => {
+        const status = record.status ?? 'REQUIRED'
+        const actionable = !['COMPLETED', 'CANCELLED'].includes(status.toUpperCase())
+        return <article className="workflow-card" key={record.id}>
+          <div className="workflow-card-heading"><div><span className="eyebrow">REQUIRED RECAP</span><h3>{record.eventTitle ?? record.title ?? 'Meeting note'}</h3></div><span className={`workflow-status ${statusClass(status)}`}>{statusText(status)}</span></div>
+          <div className="workflow-card-meta"><span><Clock3 size={13} />{formatDateTime(record.meetingAt ?? record.createdAt)}</span>{record.eventId && <span>Event {record.eventId}</span>}</div>
+          {record.summary && <p className="workflow-description">{record.summary}</p>}
+          {record.cancellationReason && <p className="workflow-note">Cancelled: {record.cancellationReason}</p>}
+          {actionable && <div className="workflow-card-actions"><button type="button" className="button button-primary button-small" onClick={() => setAction({ record, mode: 'complete' })}><Check size={13} />Complete note</button><button type="button" className="button button-ghost button-small danger-action" onClick={() => setAction({ record, mode: 'cancel' })}>Cancel requirement</button></div>}
+        </article>
+      })}
+    </WorkflowListPanel>
+    {action && <MeetingNoteActionDialog record={action.record} mode={action.mode} onClose={() => setAction(null)} onSaved={() => { setAction(null); reload() }} />}
+  </section>
+}
+
 const navItems = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
   { to: '/people', label: 'People', icon: UsersRound },
   { to: '/companies', label: 'Companies', icon: Building2 },
   { to: '/opportunities', label: 'Opportunities', icon: BriefcaseBusiness },
+  { to: '/events', label: 'Events', icon: CalendarDays },
+  { to: '/follow-ups', label: 'Follow-ups', icon: ListChecks },
+  { to: '/introductions', label: 'Warm introductions', icon: GitBranch },
+  { to: '/meeting-notes', label: 'Meeting-note requirements', icon: ClipboardCheck },
   { to: '/notes', label: 'Notes & meetings', icon: FileText },
 ]
 
@@ -647,6 +1021,10 @@ export default function App() {
         <Route path="/people" element={<ResourcePage definition={peopleDefinition} />} />
         <Route path="/companies" element={<ResourcePage definition={companiesDefinition} />} />
         <Route path="/opportunities" element={<ResourcePage definition={opportunityDefinition} />} />
+        <Route path="/events" element={<EventsPage />} />
+        <Route path="/follow-ups" element={<FollowUpsPage />} />
+        <Route path="/introductions" element={<IntroductionsPage />} />
+        <Route path="/meeting-notes" element={<MeetingNotesPage />} />
         <Route path="/notes" element={<ResourcePage definition={notesDefinition} />} />
         <Route path="/admin/users" element={isAdmin ? <AdminUsersPage currentUserId={typeof (identity as UserIdentity & { id?: string }).id === 'string' ? (identity as UserIdentity & { id?: string }).id : undefined} /> : <AccessDeniedPage />} />
         <Route path="/search" element={<FullSearchPage />} />
@@ -724,7 +1102,16 @@ function RecordDetailPage() {
 
   const pageTitle = safeResource === 'people' ? 'People' : safeResource === 'companies' ? 'Companies' : safeResource === 'opportunities' ? 'Opportunities' : 'Notes & meetings'
   const formDefinition: ResourceFormDefinition | null = safeResource === 'people' ? peopleDefinition : safeResource === 'companies' ? companiesDefinition : safeResource === 'opportunities' ? opportunityDefinition : safeResource === 'notes' ? notesDefinition : null
-  return <section className="page-stack"><button type="button" className="back-link" onClick={() => navigate(safeResource ? `/${safeResource}` : '/')}><ArrowLeft size={14} />Back to {pageTitle.toLowerCase()}</button>{loading ? <LoadingState label="Loading record…" /> : error ? <ErrorState message={error} onRetry={() => setToken((value) => value + 1)} /> : record ? <div className="detail-panel"><div className="detail-heading"><div><div className="eyebrow">{pageTitle.toUpperCase()} / RECORD</div><h1>{String(record.fullName ?? record.name ?? record.title ?? 'Record')}</h1></div><div className="detail-actions">{record.stage != null && <StagePill stage={String(record.stage)} />}{formDefinition && <button type="button" className="button button-ghost button-small" onClick={() => setEditOpen(true)}>Edit record</button>}</div></div><div className="detail-fields">{Object.entries(record).filter(([key, value]) => key !== 'id' && value != null && (typeof value !== 'object' || Array.isArray(value))).map(([key, value]) => <div className="detail-field" key={key}><span>{key.replace(/([A-Z])/g, ' $1').replace(/^./, (letter) => letter.toUpperCase())}</span><strong>{Array.isArray(value) ? value.map((item) => typeof item === 'object' && item !== null ? String((item as Record<string, unknown>).name ?? (item as Record<string, unknown>).fullName ?? (item as Record<string, unknown>).email ?? '') : String(item)).filter(Boolean).join(', ') || '—' : String(value)}</strong></div>)}</div>{record.description != null && <div className="detail-description"><span className="eyebrow">ABOUT</span><p>{String(record.description)}</p></div>}</div> : null}{editOpen && record && formDefinition && <RecordFormDialog definition={formDefinition} record={record} onClose={() => setEditOpen(false)} onSaved={() => { setEditOpen(false); setToken((value) => value + 1) }} />}</section>
+  return <section className="page-stack">
+    <button type="button" className="back-link" onClick={() => navigate(safeResource ? `/${safeResource}` : '/')}><ArrowLeft size={14} />Back to {pageTitle.toLowerCase()}</button>
+    {loading ? <LoadingState label="Loading record…" /> : error ? <ErrorState message={error} onRetry={() => setToken((value) => value + 1)} /> : record ? <div className="detail-panel">
+      <div className="detail-heading"><div><div className="eyebrow">{pageTitle.toUpperCase()} / RECORD</div><h1>{String(record.fullName ?? record.name ?? record.title ?? 'Record')}</h1></div><div className="detail-actions">{record.stage != null && <StagePill stage={String(record.stage)} />}{formDefinition && <button type="button" className="button button-ghost button-small" onClick={() => setEditOpen(true)}>Edit record</button>}</div></div>
+      {Array.isArray(record.introductionObligations) && record.introductionObligations.length > 0 && <section className="detail-description introduction-obligations"><span className="eyebrow">YOUR INTRODUCTION OBLIGATIONS</span>{(record.introductionObligations as Array<Record<string, unknown>>).map((obligation, index) => <p key={`${String(obligation.chainId ?? index)}-${String(obligation.position ?? index)}`}>Introduce <strong>{String(obligation.targetPersonName ?? 'the next person')}</strong>{obligation.followUpAt ? ` · follow up ${formatDate(String(obligation.followUpAt))}` : ''}{obligation.notes ? ` · ${String(obligation.notes)}` : ''}</p>)}<Link to="/introductions" className="one-time-link-open">Open introduction chains</Link></section>}
+      <div className="detail-fields">{Object.entries(record).filter(([key, value]) => key !== 'id' && key !== 'introductionObligations' && value != null && (typeof value !== 'object' || Array.isArray(value))).map(([key, value]) => <div className="detail-field" key={key}><span>{key.replace(/([A-Z])/g, ' $1').replace(/^./, (letter) => letter.toUpperCase())}</span><strong>{Array.isArray(value) ? value.map((item) => typeof item === 'object' && item !== null ? String((item as Record<string, unknown>).name ?? (item as Record<string, unknown>).fullName ?? (item as Record<string, unknown>).email ?? '') : String(item)).filter(Boolean).join(', ') || '—' : String(value)}</strong></div>)}</div>
+      {record.description != null && <div className="detail-description"><span className="eyebrow">ABOUT</span><p>{String(record.description)}</p></div>}
+    </div> : null}
+    {editOpen && record && formDefinition && <RecordFormDialog definition={formDefinition} record={record} onClose={() => setEditOpen(false)} onSaved={() => { setEditOpen(false); setToken((value) => value + 1) }} />}
+  </section>
 }
 
 function NotFoundPage() {

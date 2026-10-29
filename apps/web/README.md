@@ -6,12 +6,8 @@ React 19 + TypeScript + Vite frontend. It is intentionally self-contained under
 
 ## Development
 
-```sh
-npm install
-npm run dev
-npm run typecheck
-npm run build
-```
+From the repository root, install once with `npm ci`, then run `npm run dev:web`,
+`npm run typecheck -w @resoloon/web`, or `npm run build -w @resoloon/web`.
 
 ## REST contract used by the frontend
 
